@@ -57,8 +57,8 @@ ren と同様、5種の表情png をassets/ に配置する。
 |---|---|---|
 | normal | `ai_normal.png` | にっこり微笑み（ベースライン）。口角少し上がる、目はやさしく開く |
 | joyful | `ai_joyful.png` | 大きい笑顔。目を細めて閉じ気味、口を大きく開いて歯見える、両頬赤み |
-| fun | `ai_fun.png` | はしゃぎ。ウインク（片目つむる）、舌チラ、両手ピースサイン |
-| sad | `ai_sad.png` | 困り眉、口角下がる、目に涙うっすら、肩ややしぼむ |
+| fun | `ai_fun.png` | はしゃぎ。ウインク（片目つむる）、舌チラ、頬うっすら赤み |
+| sad | `ai_sad.png` | 困り眉、口角下がる、目に涙うっすら |
 | angry | `ai_angry.png` | ぷんぷん。眉吊り上げ、口角きゅっと結ぶ、頬膨らませる |
 
 **共通仕様**:
@@ -92,10 +92,10 @@ Resolution: 1024x1536 vertical (2:3 aspect ratio).
 | 表情 | プロンプト追記 |
 |---|---|
 | normal | `Expression: gentle smile, slight upturned mouth corners, soft open eyes, calm and friendly.` |
-| joyful | `Expression: big bright smile with visible teeth, eyes narrowed in delight, both cheeks flushed pink, joyful sparkle.` |
-| fun | `Expression: playful wink (one eye closed), tongue slightly out, both hands forming peace signs near face, mischievous fun energy.` |
-| sad | `Expression: troubled eyebrows tilted down, mouth corners drooped, slight tears welling in eyes, shoulders softly slumped.` |
-| angry | `Expression: pouty annoyed face, eyebrows raised in frustration, lips pressed tight in small frown, cheeks puffed, fists clenched lightly.` |
+| joyful | `Expression: big bright smile with visible teeth, eyes narrowed in delight, both cheeks flushed pink, joyful sparkle. KEEP THE SAME POSE AS THE REFERENCE — body posture and hands identical, only facial expression changes.` |
+| fun | `Expression: playful wink (one eye closed), tongue slightly out, soft cheek blush, mischievous fun energy. KEEP THE SAME POSE AS THE REFERENCE — hands and body posture identical, only facial expression changes.` |
+| sad | `Expression: troubled eyebrows tilted down, mouth corners drooped, slight tears welling in eyes. KEEP THE SAME POSE AS THE REFERENCE — body posture, shoulders, and hands identical, only facial expression changes.` |
+| angry | `Expression: pouty annoyed face, eyebrows raised in frustration, lips pressed tight in small frown, cheeks puffed. KEEP THE SAME POSE AS THE REFERENCE — body posture and hands identical, only facial expression changes.` |
 
 ## 生成手順（お兄ちゃん向け）
 
