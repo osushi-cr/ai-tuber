@@ -74,10 +74,24 @@ def get_wav_duration(file_path: str) -> float:
         return 3.0
 
 
+def _estimate_seconds(text: str) -> float:
+    """音声生成に必要な秒数を文字数から推定する。
+
+    日本語の話速はおおむね 1秒 ≒ 4.5 文字。seconds が短いと末尾が不明瞭になる。
+    上限は 30s — Irodori-TTS は訓練時の固定 latent steps を超えると品質が崩れるため
+    （inference_runtime.py の `fixed_target_latent_steps` 警告参照）。30s 以上の
+    発話は呼び出し側でテキストを文単位に分割して順次 speak すること（次セッション課題）。
+    """
+    est = len(text) / 4.5 + 2.0
+    return max(8.0, min(30.0, est))
+
+
 def _synthesize_sync(text: str) -> tuple[str, float]:
     from irodori_tts.inference_runtime import SamplingRequest, save_wav
 
     runtime = _get_runtime()
+    seconds = _estimate_seconds(text)
+    logger.info(f"[synth] text_len={len(text)} -> seconds={seconds:.1f}")
     result = runtime.synthesize(
         SamplingRequest(
             text=text,
@@ -89,7 +103,7 @@ def _synthesize_sync(text: str) -> tuple[str, float]:
             ref_ensure_max=True,
             num_candidates=1,
             decode_mode="sequential",
-            seconds=30.0,
+            seconds=seconds,
             max_ref_seconds=30.0,
             num_steps=IRODORI_NUM_STEPS,
             cfg_scale_text=3.0,

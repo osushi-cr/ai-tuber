@@ -5,6 +5,8 @@ from pathlib import Path
 
 import uvicorn
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
 
 def _load_dotenv() -> None:
@@ -44,7 +46,18 @@ async def startup():
     """アプリケーション起動時の処理"""
     await body_service.start_worker()
 
-app = Starlette(routes=body_app.get_routes(), on_startup=[startup])
+# CORS: allow OBS Browser Source (origin "null" for file://) and any local origin
+# to fetch /api/comments — local-only deployment, so we accept all origins.
+_middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    ),
+]
+
+app = Starlette(routes=body_app.get_routes(), on_startup=[startup], middleware=_middleware)
 
 
 if __name__ == "__main__":

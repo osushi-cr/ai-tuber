@@ -53,6 +53,22 @@ class BodyApp:
             logger.error(f"Error in get_comments API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def inject_comment_api(self, request: Request) -> JSONResponse:
+        """ローカル/テスト用: ダミーコメントを注入する。次の /api/comments 取得で返る。"""
+        try:
+            body = await request.json()
+            author = body.get("author", "guest")
+            message = body.get("message", "")
+            if not message:
+                return JSONResponse({"status": "error", "message": "missing 'message'"}, status_code=400)
+            if not hasattr(self.service, "inject_comment"):
+                return JSONResponse({"status": "error", "message": "not supported by this body"}, status_code=405)
+            result = await self.service.inject_comment(author, message)
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in inject_comment API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     async def start_broadcast_api(self, request: Request) -> JSONResponse:
         try:
             body = await request.json() if request.headers.get("content-type") == "application/json" else {}
@@ -85,6 +101,7 @@ class BodyApp:
             Route("/api/speak", self.speak_api, methods=["POST"]),
             Route("/api/change_emotion", self.change_emotion_api, methods=["POST"]),
             Route("/api/comments", self.get_comments_api, methods=["GET"]),
+            Route("/api/comments/inject", self.inject_comment_api, methods=["POST"]),
             Route("/api/broadcast/start", self.start_broadcast_api, methods=["POST"]),
             Route("/api/broadcast/stop", self.stop_broadcast_api, methods=["POST"]),
             Route("/api/queue/wait", self.wait_for_queue_api, methods=["POST"]),

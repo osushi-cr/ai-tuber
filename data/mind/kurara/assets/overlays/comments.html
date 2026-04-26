@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>kurara comment overlay</title>
+<style>
+  /* OBS Browser Source 用：透明背景・キャンバス端（右下）からの表示 */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif;
+    color: #1A2847;
+  }
+
+  #comments {
+    position: absolute;
+    right: 60px;
+    bottom: 60px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    width: 880px;
+    pointer-events: none;
+  }
+
+  .comment {
+    background: rgba(255, 255, 255, 0.95);
+    border-left: 12px solid #CC785C;
+    border-radius: 30px;
+    padding: 32px 40px;
+    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.25);
+    backdrop-filter: blur(10px);
+    transform: translateX(120%);
+    opacity: 0;
+    animation: slideIn 0.5s ease-out forwards, slideOut 0.6s ease-in 8s forwards;
+  }
+
+  .comment .author {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 36px;
+    font-weight: 700;
+    color: #CC785C;
+    margin-bottom: 14px;
+  }
+
+  .comment .author::before {
+    content: "";
+    display: inline-block;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #CC785C, #E89A82);
+    flex-shrink: 0;
+  }
+
+  .comment .message {
+    font-size: 44px;
+    line-height: 1.4;
+    color: #1A2847;
+    word-break: break-word;
+  }
+
+  @keyframes slideIn {
+    from { transform: translateX(120%); opacity: 0; }
+    to   { transform: translateX(0);    opacity: 1; }
+  }
+  @keyframes slideOut {
+    from { transform: translateX(0);    opacity: 1; }
+    to   { transform: translateX(120%); opacity: 0; }
+  }
+</style>
+</head>
+<body>
+<div id="comments"></div>
+<script>
+  const API_URL = "http://127.0.0.1:8000/api/comments";
+  const POLL_INTERVAL_MS = 2000;
+  const MAX_VISIBLE = 4;
+  const seenIds = new Set();
+
+  function render(author, message) {
+    const root = document.getElementById("comments");
+    const node = document.createElement("div");
+    node.className = "comment";
+    const a = document.createElement("div");
+    a.className = "author";
+    a.textContent = author;
+    const m = document.createElement("div");
+    m.className = "message";
+    m.textContent = message;
+    node.appendChild(a);
+    node.appendChild(m);
+    root.appendChild(node);
+    while (root.childElementCount > MAX_VISIBLE) {
+      root.removeChild(root.firstElementChild);
+    }
+    setTimeout(() => { node.remove(); }, 9000);
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch(API_URL, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = Array.isArray(data?.comments) ? data.comments : [];
+      for (const c of items) {
+        const id = c.id ?? `${c.author}-${c.message}-${c.timestamp ?? ""}`;
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        render(c.author ?? "guest", c.message ?? "");
+      }
+    } catch (e) {
+      // network error; ignore and retry next tick
+    }
+  }
+
+  // self-test stub: render an example so OBS Browser Source preview shows something on load
+  if (location.search.includes("demo=1")) {
+    render("くららファン", "配信たのしー！");
+    setTimeout(() => render("お兄ちゃん", "おお、コメント出るね"), 1500);
+  }
+
+  setInterval(poll, POLL_INTERVAL_MS);
+  poll();
+</script>
+</body>
+</html>

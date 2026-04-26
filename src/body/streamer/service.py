@@ -27,6 +27,21 @@ class StreamerBodyService(BodyServiceBase):
         self._action_queue = asyncio.Queue()
         self._worker_task = None
         self._pending_broadcast_config = None
+        # Test/local injected comments (drained on each get_comments call).
+        # In production this is empty and YouTube live chat fills the response.
+        self._dummy_comments: list[dict] = []
+        self._dummy_comment_seq = 0
+
+    async def inject_comment(self, author: str, message: str) -> str:
+        """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
+        self._dummy_comment_seq += 1
+        self._dummy_comments.append({
+            "id": f"dummy_{self._dummy_comment_seq}",
+            "author": author or "guest",
+            "message": message or "",
+        })
+        logger.info(f"[inject_comment] {author}: {message}")
+        return "Comment injected"
 
     async def start_worker(self):
         """バックグラウンドワーカーを開始します。"""
@@ -114,24 +129,26 @@ class StreamerBodyService(BodyServiceBase):
         return "Emotion change queued"
 
     async def get_comments(self) -> str:
-        """コメントを取得します。"""
+        """コメントを取得します（YouTube live chat ＋ ダミー注入分の両方）。"""
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
-        
+
+        comments: list[dict] = []
         try:
             if streaming_mode and self._youtube_comment_adapter:
-                comments = self._youtube_comment_adapter.get()
-            else:
-                # 配信モードでない場合やアダプターがない場合は空リストを返す
-                comments = []
-            
-            if not comments:
-                return json.dumps([])
-            
-            logger.info(f"[get_comments] Retrieved {len(comments)} comments")
-            return json.dumps(comments, ensure_ascii=False)
+                comments.extend(self._youtube_comment_adapter.get() or [])
         except Exception as e:
-            logger.error(f"Error in get_comments tool: {e}")
+            logger.error(f"Error fetching YouTube comments: {e}")
+
+        # Drain dummy comments (test/local).
+        if self._dummy_comments:
+            comments.extend(self._dummy_comments)
+            self._dummy_comments = []
+
+        if not comments:
             return json.dumps([])
+
+        logger.info(f"[get_comments] Retrieved {len(comments)} comments")
+        return json.dumps(comments, ensure_ascii=False)
 
     async def start_broadcast(self, config: Optional[Dict[str, Any]] = None) -> str:
         """配信または録画の開始を予約します（最初の発話時に同期して開始されます）。"""
