@@ -9,6 +9,10 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# Local virtualenvs (Mac native development)
+.venv/
+.venv-*/
+
 # IDE
 .vscode/
 .idea/

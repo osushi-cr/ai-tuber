@@ -16,8 +16,8 @@ async def main():
     setup_telemetry()
     logger.info("Starting Saint Graph in Chat Mode...")
 
-    # プロンプトとテンプレートのロード
-    loader = PromptLoader(character_name="ren")
+    # プロンプトとテンプレートのロード（CHARACTER_NAME 環境変数で切替・既定 "ren"）
+    loader = PromptLoader()  # reads CHARACTER_NAME via prompt_loader's default
     system_instruction = loader.load_system_instruction()
     
     template_names = [
