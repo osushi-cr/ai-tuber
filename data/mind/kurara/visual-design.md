@@ -106,12 +106,139 @@ Resolution: 1024x1536 vertical (2:3 aspect ratio).
 5. 各pngを `data/mind/kurara/assets/` に保存
 6. 透過処理されてない場合は remove.bg などで背景透過化
 
+## ループ動画素材（Seedance 2.0 i2v）
+
+### 生成リスト（11本）
+
+| # | 元画像 | ファイル名 | プロンプト追記 | 用途 |
+|---|---|---|---|---|
+| 1 | normal.png | `normal_idle.mp4` | subtle natural breathing, slight head tilt, soft eye blinks | 待機ループ（最重要・LLM思考中の常時表示） |
+| 2 | normal.png | `normal_speaking_a.mp4` | gentle speaking motion, subtle mouth movement, occasional head nod | 通常発話A |
+| 3 | normal.png | `normal_speaking_b.mp4` | calm explanation gesture, slight head turn, eye contact engagement | 通常発話B |
+| 4 | joyful.png | `joyful_a.mp4` | excited bouncing energy, eyes sparkle, joyful head bob | 喜びA |
+| 5 | joyful.png | `joyful_b.mp4` | warm laughter, slight body sway, hair gentle movement | 喜びB |
+| 6 | fun.png | `fun_a.mp4` | playful teasing wink, mischievous head tilt, tongue gentle motion | 楽しいA |
+| 7 | fun.png | `fun_b.mp4` | giggling energy, slight shoulder shake, sparkly eyes | 楽しいB |
+| 8 | sad.png | `sad_a.mp4` | downcast eyes, soft sigh motion, slight head droop | 悲しいA |
+| 9 | sad.png | `sad_b.mp4` | troubled gaze, gentle head shake, lip quiver | 悲しいB |
+| 10 | angry.png | `angry_a.mp4` | pouty cheek puff, narrowed eyes, slight head turn-away | 怒りA |
+| 11 | angry.png | `angry_b.mp4` | irritated huff, raised eyebrow, slight foot tap | 怒りB |
+
+### 透過運用方針: OBS クロマキー（緑背景必須）
+
+MP4 (H.264 yuv420p) は**アルファチャンネル非対応**のため、動画素材で背景透過を実現するには：
+
+- ❌ 白背景 → OBSクロマキーで白を抜くと**衣装の白（ブラウス・ベレー帽・裾ライン）も一緒に抜ける**
+- ❌ アルファ付きMP4 → そもそも H.264 では不可
+- ✅ **緑背景 (#00FF00) → OBS クロマキー (Color Key: Green) で抜く**
+- ✅ 別解: Dreamina/Seedance で WebM (VP9) 透過出力できるか実機検証（推奨度低）
+
+**運用確定**: 全動画素材は **PURE GREEN #00FF00 背景**で生成、OBS側でクロマキー設定する。
+
+### 共通 i2v プロンプト（全本に必須）
+
+```
+SEAMLESS LOOP — first frame must match last frame for perfect cyclic playback.
+Duration: 10 seconds.
+Anime-style 2D animation, smooth cell-shaded movement, 24fps.
+Camera: completely static, no zoom, no pan, no perspective change.
+
+Background: SOLID PURE GREEN (#00FF00) for chroma key compositing — flat green screen, no texture, no gradient, no patterns. The background must be completely uniform green.
+
+Body posture: identical to source image — only natural micro-motions allowed (breathing, hair sway, blink, subtle expression nuance).
+Do not change outfit, hair, or pose composition.
+```
+
+### Seedance 生成ワークフロー（お兄ちゃん向け）
+
+**選択肢 A: Dreamina (CapCut) — 無料枠**
+1. https://dreamina.capcut.com/ にアクセス（CapCutアカウント必要）
+2. 「Image to Video」モード選択
+3. 元画像（例: normal.png）アップロード
+4. プロンプト = 「共通 i2v プロンプト」＋「該当行のプロンプト追記」を貼る
+5. Duration: 10s、解像度: 1080p（縦長）
+6. 生成 → DL → `data/mind/kurara/assets/videos/<ファイル名>.mp4` に配置
+7. 1日225トークン制限 → 1本5〜30トークン消費なので、無理なく日割り
+
+**選択肢 B: VolcEngine API — 有料**
+1. https://www.volcengine.com/ でアカウント開設
+2. Doubao Vision/動画生成 API 申請
+3. APIキー取得 → `scripts/generate_kurara_loops.py` をPython で実装（次セッション課題）
+4. 一括バッチ生成（11本×$1.4 ≈ $15.4）
+
+### ループ品質チェック観点
+
+- 動画末尾で**ガクッと跳ねないか**（first=last 確認）
+- **背景が PURE GREEN (#00FF00) で完全一様か**（グラデ・ノイズ・透けが無い）
+- **OBSクロマキー後にエッジが綺麗か**（緑のフリンジ残り＝Spill が無いか）
+- **ポーズが大幅に変わっていないか**（同じ立ち位置・体の向き）
+- **服装の細部（KRロゴ・金ボタン・ボウタイ）が崩れていないか**
+
+### OBS Studio Mac native セットアップ
+
+**1. インストール**
+```bash
+brew install --cask obs
+```
+- OBS 28.0以降は OBS WebSocket v5 がビルトイン（追加プラグイン不要）
+
+**2. OBS WebSocket 有効化**
+- OBS起動後 → メニュー「Tools → WebSocket Server Settings」
+- 「Enable WebSocket server」ON
+- Port: **4455**（obs_adapter.py のデフォルト）
+- Password: 任意設定（環境変数 `OBS_PASSWORD` に同値設定）
+
+**3. シーン構成（手動セットアップ）**
+
+obs_adapter.py が想定する **7ソース** をシーンに追加：
+
+| ソース名 | 種類 | ファイル | ループ | 用途 |
+|---|---|---|---|---|
+| `BGM` | メディアソース | （任意のmp3） | ✅ | 配信BGM（無くても可） |
+| `voice` | メディアソース | （空または `~/.cache/ai-tuber/voice/dummy.wav`） | ❌ | Irodori-TTS出力を動的更新 |
+| `silent` | メディアソース | `assets/videos/normal_idle.mp4` | ✅ | 待機ループ（最重要・常時表示候補） |
+| `normal` | メディアソース | `assets/videos/normal_speaking_a.mp4` | ✅ | 通常発話 |
+| `joyful` | メディアソース | `assets/videos/joyful_a.mp4` | ✅ | 喜び発話 |
+| `fun` | メディアソース | `assets/videos/fun_a.mp4` | ✅ | 楽しい発話 |
+| `sad` | メディアソース | `assets/videos/sad_a.mp4` | ✅ | 悲しみ発話 |
+| `angry` | メディアソース | `assets/videos/angry_a.mp4` | ✅ | 怒り発話 |
+
+**ソース名は厳密一致必須**（obs_adapter.py の `EMOTION_MAP` が参照）。
+
+**4. Color Key フィルタ（表情6ソース全てに適用）**
+
+各動画ソース（silent / normal / joyful / fun / sad / angry）を右クリック → **「フィルタ」** → 「**+** → エフェクトフィルタ → カラーキー」：
+
+| 設定 | 値 |
+|---|---|
+| キーカラータイプ | カスタム |
+| キーカラー | `#00FF00` |
+| 類似性 | 400 |
+| 滑らかさ | 80 |
+| キー色のスピル削減 | 50 |
+
+**5. 各ソース共通設定**
+- ファイルパス: 絶対パス推奨（`/Users/yoshida/src/github.com/osushi-cr/ai-tuber/data/mind/kurara/assets/videos/...`）
+- ループ: 表情6ソース全てON、voice はOFF
+- 「無効時にファイルを閉じる」: OFF（高速切替のため）
+- 「アクティブ時にリスタート」: voice のみ ON
+
+**6. 初期表示状態**
+- silent: ✅表示
+- normal/joyful/fun/sad/angry: ❌非表示
+- voice: ✅表示（音声ミュートで音だけ管理）
+- 配信開始時: silent + voice が表示、表情ソースは音声再生時に切り替え
+
+### scene config 自動生成（次セッション課題）
+
+ren のような JSON scene file を kurara 用に作って配布できるようにすると、GUI セットアップを skip できる。
+Phase 2 で `data/mind/kurara/scene-config/Kurara.json` を自動生成スクリプトと共に提供する。
+
 ## 次フェーズ（このスコープ外）
 
-- **ループmp4**（Seedance 2.0 i2v、表情png × 動き）
-- **待機mp4**（silent loop）
 - **reference.wav 5感情**（肉声録音）
-- **フィラーwav 10〜20本**（Irodori-TTSで生成）
+- **フィラーwav追加生成**（Irodori-TTSで・必要に応じて）
+- **配信フロー結線**（Irodori-TTS HTTP化 + OBS統合）
 
 ## 参考リンク
 
