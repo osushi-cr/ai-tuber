@@ -234,11 +234,65 @@ obs_adapter.py が想定する **7ソース** をシーンに追加：
 ren のような JSON scene file を kurara 用に作って配布できるようにすると、GUI セットアップを skip できる。
 Phase 2 で `data/mind/kurara/scene-config/Kurara.json` を自動生成スクリプトと共に提供する。
 
+## 配信背景（くららの部屋）
+
+配信中の背景として、表情ソースの最背面に重ねる固定画像。
+
+### 仕様
+
+| 項目 | 値 |
+|---|---|
+| ファイル名 | `assets/backgrounds/room_main.png` |
+| 解像度 | 1920×1080 (16:9 OBSキャンバス標準) |
+| 透過 | 不要（部屋の絵そのものが背景） |
+| カラー | Crail (#CC785C) 基調・cream wall・light wood furniture |
+| 構図 | カメラ目線・中央前景はキャラ立ち位置のため空け |
+
+### ChatGPT image-2 プロンプト
+
+```
+Anime-style 2D illustration, soft cell-shading, warm cozy atmosphere.
+
+Scene: A 14-year-old anime girl's bedroom designed for AITuber streaming.
+Camera: facing the room from where the streamer would be standing — a clean view of the wall and furniture, suitable as a green-screen-friendly background overlay (the character will be composited in the foreground later).
+
+Color palette (Anthropic Claude brand):
+- Warm coral / Crail (#CC785C) as primary accent
+- Cream (#F5F4EE) walls
+- Light wood furniture (#C9A87A)
+- Soft pink and gold highlights
+
+Room contents:
+- A wooden study desk on the right with a sleek laptop, headphones, and a small plush mascot
+- A bookshelf on the left filled with novels, manga, and a few framed photos
+- A bed in the back with coral-colored bedding and white pillows
+- A round window with sheer white curtains letting in soft afternoon light
+- Some potted plants and string fairy lights for ambiance
+- A few cute pastel posters/paintings on the wall (no recognizable copyrighted IP)
+- Subtle "KR" themed décor accent (a pennant or pillow with KR initial)
+
+Composition: Wide angle, slightly looking down. Empty space in the center foreground where the character will stand (do not place any furniture there).
+Background: NOT transparent — keep the room scene as the actual image content.
+Resolution: 1920x1080 horizontal (16:9 widescreen for OBS canvas).
+No text, no people, no logos.
+```
+
+### OBS追加手順
+
+1. **画像ソース追加**: 「ソース」パネル「+」→「画像」
+2. **ソース名**: `background_room`
+3. **画像ファイル**: `~/src/github.com/osushi-cr/ai-tuber/data/mind/kurara/assets/backgrounds/room_main.png`
+4. **配置**: ソース一覧で**最背面**にドラッグ（一番下）
+5. **キャンバスにフィット**: 右クリック →「変換」→「画面に合わせる」
+
+→ プレビューで「くららの部屋＋立ってるくらら」が合成表示されればOK✨
+
 ## 次フェーズ（このスコープ外）
 
 - **reference.wav 5感情**（肉声録音）
 - **フィラーwav追加生成**（Irodori-TTSで・必要に応じて）
-- **配信フロー結線**（Irodori-TTS HTTP化 + OBS統合）
+- **YouTube OAuth → コメント取得→OBS Browser Source 合成**
+- **Saint Graph 本体起動**（GEMINI_API_KEY+ADK）→ 配信ループ実機テスト
 
 ## 参考リンク
 
