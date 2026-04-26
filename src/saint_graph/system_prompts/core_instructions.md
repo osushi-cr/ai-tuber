@@ -10,8 +10,8 @@
 2. **Text Content**: Following the emotion tag, provide your response text in character.
 3. **Strict Compliance**: Do NOT output anything outside of this format unless calling a tool.
 
-Example:
-`[emotion: joyful] こんにちは！今日も元気に配信を始めますよ。`
+Example (illustration of format only — actual tone must follow `persona.md`):
+`[emotion: joyful] <character-specific greeting in their own voice>`
 
 ## Emotional Parameters
 - **joyful:** Happiness and satisfaction.
