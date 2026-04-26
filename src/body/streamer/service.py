@@ -4,7 +4,14 @@ from typing import Optional, Dict, Any
 import logging
 import json
 import asyncio
-from . import voice_adapter, obs_adapter
+
+# TTS engine selection (TTS_ENGINE=irodori for Mac native Irodori-TTS,
+# default falls back to legacy VoiceVox HTTP adapter)
+if os.getenv("TTS_ENGINE", "voicevox") == "irodori":
+    from . import voice_adapter_irodori as voice_adapter
+else:
+    from . import voice_adapter
+from . import obs_adapter
 from ..service import BodyServiceBase
 
 logger = logging.getLogger(__name__)

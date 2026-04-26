@@ -1,11 +1,32 @@
 """Body Streamer - REST API Server Entry Point"""
 import os
 import logging
+from pathlib import Path
+
 import uvicorn
 from starlette.applications import Starlette
-from .service import body_service
-from .utils import ensure_youtube_secrets
-from ..rest import BodyApp
+
+
+def _load_dotenv() -> None:
+    """Load `.env` from the nearest ancestor directory (Mac native dev convenience)."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        env_file = parent / ".env"
+        if env_file.is_file():
+            for raw in env_file.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            return
+
+
+_load_dotenv()
+
+from .service import body_service  # noqa: E402  (after dotenv so TTS_ENGINE etc. are visible)
+from .utils import ensure_youtube_secrets  # noqa: E402
+from ..rest import BodyApp  # noqa: E402
 
 # ログ設定
 logging.basicConfig(
