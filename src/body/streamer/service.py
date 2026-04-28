@@ -5,10 +5,15 @@ import logging
 import json
 import asyncio
 
-# TTS engine selection (TTS_ENGINE=irodori for Mac native Irodori-TTS,
-# default falls back to legacy VoiceVox HTTP adapter)
-if os.getenv("TTS_ENGINE", "voicevox") == "irodori":
+# TTS engine selection
+#   TTS_ENGINE=irodori: Mac native Irodori-TTS (in-process, 16.7s/utterance)
+#   TTS_ENGINE=miotts:  MioTTS HTTP API client (out-of-process, ~2.2s/30char)
+#   default:            legacy VoiceVox HTTP adapter
+TTS_ENGINE = os.getenv("TTS_ENGINE", "voicevox")
+if TTS_ENGINE == "irodori":
     from . import voice_adapter_irodori as voice_adapter
+elif TTS_ENGINE == "miotts":
+    from . import voice_adapter_miotts as voice_adapter
 else:
     from . import voice_adapter
 from . import obs_adapter
