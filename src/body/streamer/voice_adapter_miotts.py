@@ -98,7 +98,7 @@ VOICE_DIR.mkdir(parents=True, exist_ok=True)
 # 一方、短文（30字未満）は逆に間延びして話速が遅くなる傾向がある。
 # voice_adapter 側で句点分割→短文マージ→長文の読点分割→順次生成→wav結合 することで
 # 30〜100字のスイートスポットに収めて安定生成する。
-_SENTENCE_MAX_CHARS = int(os.getenv("MIOTTS_SENTENCE_MAX_CHARS", "60"))
+_SENTENCE_MAX_CHARS = int(os.getenv("MIOTTS_SENTENCE_MAX_CHARS", "50"))
 _SENTENCE_MIN_CHARS = int(os.getenv("MIOTTS_SENTENCE_MIN_CHARS", "20"))
 
 
@@ -145,7 +145,16 @@ def _split_sentences(
                 sub_buf += sp
         if sub_buf.strip():
             result.append(sub_buf.strip())
-    return [s for s in result if s]
+
+    # 最終 fail-safe: 句点も読点もない長文を max_chars でぶつ切り（暴走の根絶）
+    final: list[str] = []
+    for s in result:
+        while len(s) > max_chars:
+            final.append(s[:max_chars])
+            s = s[max_chars:]
+        if s.strip():
+            final.append(s.strip())
+    return [s for s in final if s]
 
 
 def get_wav_duration(file_path: str) -> float:
