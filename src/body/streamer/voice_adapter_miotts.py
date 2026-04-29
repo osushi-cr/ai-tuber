@@ -265,12 +265,43 @@ def _concat_wavs(wav_paths: list[Path], out_path: Path) -> None:
         out.writeframes(all_frames)
 
 
-def _post_tts(text: str) -> bytes:
-    """MioTTS API に正規化済みテキストを POST して wav バイナリを返す。"""
+# style → MioTTS API パラメータのマップ。preset_id（MioTTS-Inference の presets/*.pt 名）と
+# llm サンプリングパラメータ（temperature 等）を組み合わせて感情差を出す。
+# 未登録 style は neutral にフォールバックする（sad/angry/fun は今後素材を追加して拡張予定）。
+_DEFAULT_TOP_P = 0.95
+_DEFAULT_REPETITION_PENALTY = 1.05
+
+_STYLE_PARAMS: dict[str, dict] = {
+    "neutral": {
+        "preset_id": MIOTTS_PRESET_ID,
+        "temperature": 0.5,
+        "top_p": _DEFAULT_TOP_P,
+        "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+    },
+    "joyful": {
+        "preset_id": "kurara_joyful",
+        "temperature": 1.2,
+        "top_p": _DEFAULT_TOP_P,
+        "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+    },
+}
+
+
+def _resolve_style(style: str) -> dict:
+    return _STYLE_PARAMS.get(style, _STYLE_PARAMS["neutral"])
+
+
+def _post_tts(text: str, params: dict) -> bytes:
+    """MioTTS API に正規化済みテキストと style パラメータを POST して wav バイナリを返す。"""
     payload = {
         "text": text,
-        "reference": {"type": "preset", "preset_id": MIOTTS_PRESET_ID},
+        "reference": {"type": "preset", "preset_id": params["preset_id"]},
         "output": {"format": "wav"},
+        "llm": {
+            "temperature": params["temperature"],
+            "top_p": params["top_p"],
+            "repetition_penalty": params["repetition_penalty"],
+        },
     }
     with httpx.Client(timeout=MIOTTS_TIMEOUT) as client:
         resp = client.post(f"{MIOTTS_API_BASE}/v1/tts", json=payload)
@@ -278,16 +309,18 @@ def _post_tts(text: str) -> bytes:
         return resp.content
 
 
-def _synthesize_sync(text: str) -> tuple[str, float]:
+def _synthesize_sync(text: str, style: str) -> tuple[str, float]:
     # 正規化→分割→送信 の順序を厳密に守る（split時点で絵文字・空白等が残ってると暴走の元）
     normalized = _normalize_text(text)
     sentences = _split_sentences(normalized)
+    params = _resolve_style(style)
     logger.info(
-        f"[synth] text_len={len(text)}->{len(normalized)} sentences={len(sentences)} preset={MIOTTS_PRESET_ID}"
+        f"[synth] text_len={len(text)}->{len(normalized)} sentences={len(sentences)} "
+        f"style={style} preset={params['preset_id']} temp={params['temperature']}"
     )
 
     if len(sentences) <= 1:
-        wav_bytes = _post_tts(normalized)
+        wav_bytes = _post_tts(normalized, params)
         filename = f"speech_{abs(hash(text)) % 100000}.wav"
         out_path = VOICE_DIR / filename
         out_path.write_bytes(wav_bytes)
@@ -296,7 +329,7 @@ def _synthesize_sync(text: str) -> tuple[str, float]:
     # 多文: 各文を順次生成→ wav 結合
     parts: list[Path] = []
     for i, sent in enumerate(sentences):
-        wav_bytes = _post_tts(sent)
+        wav_bytes = _post_tts(sent, params)
         part_path = VOICE_DIR / f"speech_{abs(hash(text)) % 100000}_part{i}.wav"
         part_path.write_bytes(wav_bytes)
         parts.append(part_path)
@@ -314,8 +347,9 @@ async def generate_and_save(
 ) -> tuple[str, float]:
     """Generate speech via MioTTS HTTP API and save to VOICE_DIR.
 
-    Mirrors voice_adapter_irodori I/F. style/speaker_id are accepted for
-    compatibility but currently unused.
+    `style` は _STYLE_PRESET_MAP で対応する MioTTS プリセットを選択する。未登録 style は
+    ベース preset（neutral）にフォールバックする。`speaker_id` は voice_adapter_irodori との
+    I/F 互換のため受け取るが MioTTS では未使用。
     """
     logger.info("Generating speech: '%s' (style=%s)", text, style)
-    return await asyncio.to_thread(_synthesize_sync, text)
+    return await asyncio.to_thread(_synthesize_sync, text, style)
