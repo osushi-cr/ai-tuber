@@ -65,8 +65,32 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
 # ---------------------------------------------------------------------------
 
 async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
-    """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。"""
-    await ctx.saint_graph.process_intro()
+    """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。
+
+    intro→news1 間の沈黙を最小化するため、intro セリフ生成と並行して
+    news1 セリフを先取り生成する。Gemini 単一セッションで並行呼び出しが
+    解決できる場合は完全並行、そうでなければ直列だが voice キューに 2 個
+    積まれて auto-filler が間を埋めるので体感差はあまり出ない。
+    """
+    intro_task = asyncio.create_task(ctx.saint_graph.process_intro())
+
+    news1_task = None
+    if ctx.news_service.has_next():
+        first_item = ctx.news_service.peek_current_item()
+        if first_item:
+            logger.info(f"Prefetching news1: {first_item.title}")
+            news1_task = asyncio.create_task(
+                ctx.saint_graph.process_news_reading(
+                    title=first_item.title, content=first_item.content
+                )
+            )
+            # peek 分のインデックスを進めて handle_news が news[1] から始まるようにする
+            ctx.news_service.get_next_item()
+
+    await intro_task
+    if news1_task is not None:
+        await news1_task
+
     return BroadcastPhase.NEWS
 
 
