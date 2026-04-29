@@ -20,7 +20,7 @@ class BroadcastPhase(Enum):
     """配信のフェーズを表す列挙型。"""
     INTRO   = "intro"     # 開始挨拶
     NEWS    = "news"      # ニュース読み上げ中
-    IDLE    = "idle"      # ニュース終了 → コメント待ち
+    QA      = "qa"        # ニュース終了 → コメント拾いコーナー（促進セリフ＋コメント反応）
     CLOSING = "closing"   # 締めの挨拶 → 配信停止
 
 
@@ -73,7 +73,9 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     """
     NEWS: コメント優先で確認し、なければニュースを 1 本読み上げる。
-    ニュースを全消化したら IDLE へ遷移する。
+    ニュース読み終わり毎に aizuchi 系のフィラーを 1 個キューに積み、
+    次のニュースのセリフ生成中の沈黙を埋める。
+    ニュースを全消化したら QA へ遷移する。
     """
     # コメント優先
     if await _poll_and_respond(ctx):
@@ -89,32 +91,50 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
             await ctx.saint_graph.process_news_reading(title=item.title, content=item.content)
             # 成功したのでインデックスを進める
             ctx.news_service.get_next_item()
+            # ニュース完了→次のセリフ生成中（Gemini応答待ち）の沈黙を埋めるため、
+            # aizuchi 系の filler を 1 個キューに積む。voice キューに積まれるので
+            # 次の発話が始まるまでに自然に再生される。
+            try:
+                await ctx.saint_graph.body.play_filler("aizuchi")
+            except Exception as e:
+                logger.warning(f"Failed to queue filler between news items: {e}")
             return BroadcastPhase.NEWS
 
-    # ニュース全消化 → IDLE へ
-    logger.info("All news items read. Waiting for final comments.")
+    # ニュース全消化 → QA（コメント拾いコーナー）へ
+    logger.info("All news items read. Moving to QA (comment corner).")
     await ctx.saint_graph.process_news_finished()
-    return BroadcastPhase.IDLE
+    return BroadcastPhase.QA
 
 
-async def handle_idle(ctx: BroadcastContext) -> BroadcastPhase:
+# QA で促進セリフを発する間隔（poll サイクル数）。1cycle = POLL_INTERVAL 秒。
+_QA_PROMPT_EVERY = int(os.getenv("BROADCAST_QA_PROMPT_EVERY", "5"))
+
+
+async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
     """
-    IDLE: コメントを待ち、あれば応答してカウンタをリセットする。
-    タイムアウトしたら CLOSING へ遷移する。
+    QA: コメント拾いコーナー。コメントがあれば反応し、無いときは
+    `_QA_PROMPT_EVERY` サイクル毎に「コメント募集」促進セリフを発する。
+    沈黙が `MAX_WAIT_CYCLES` 続いたら CLOSING へ遷移する。
     """
     if await _poll_and_respond(ctx):
         ctx.idle_counter = 0
-        return BroadcastPhase.IDLE
+        return BroadcastPhase.QA
 
     ctx.idle_counter += 1
     if ctx.idle_counter > MAX_WAIT_CYCLES:
         logger.info(
-            f"Silence timeout ({MAX_WAIT_CYCLES} cycles) reached. "
-            "Finishing broadcast."
+            f"Silence timeout ({MAX_WAIT_CYCLES} cycles) reached in QA. Closing."
         )
         return BroadcastPhase.CLOSING
 
-    return BroadcastPhase.IDLE
+    # 一定サイクル毎に促進セリフ
+    if ctx.idle_counter % _QA_PROMPT_EVERY == 1:
+        try:
+            await ctx.saint_graph.process_qa()
+        except Exception as e:
+            logger.warning(f"Failed to run QA prompt: {e}")
+
+    return BroadcastPhase.QA
 
 
 async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
@@ -135,7 +155,7 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
 _HANDLERS = {
     BroadcastPhase.INTRO:   handle_intro,
     BroadcastPhase.NEWS:    handle_news,
-    BroadcastPhase.IDLE:    handle_idle,
+    BroadcastPhase.QA:      handle_qa,
     BroadcastPhase.CLOSING: handle_closing,
 }
 
@@ -143,7 +163,7 @@ _HANDLERS = {
 _PHASE_BGM = {
     BroadcastPhase.INTRO:   "op",
     BroadcastPhase.NEWS:    "news",
-    BroadcastPhase.IDLE:    "chitchat",
+    BroadcastPhase.QA:      "chitchat",
     BroadcastPhase.CLOSING: "ed",
 }
 

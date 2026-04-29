@@ -95,6 +95,11 @@ class SaintGraph:
         template = self.templates.get("closing", "それでは、本日の配信を終了します。ありがとうございました。")
         await self.process_turn(template, context="Closing")
 
+    async def process_qa(self):
+        """コメント拾いコーナー：視聴者にコメントを促す軽いセリフを生成する。"""
+        template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
+        await self.process_turn(template, context="QA")
+
     # --- メインターン処理 ---
 
     async def process_turn(self, user_input: str, context: Optional[str] = None):

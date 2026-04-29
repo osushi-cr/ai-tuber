@@ -136,6 +136,15 @@ class BodyClient:
             return data.get("result", f"BGM {bgm_id} stopped")
         return f"Error: Failed to stop BGM {bgm_id}"
 
+    async def play_filler(self, category: str, style: str = "neutral") -> str:
+        """category 該当の filler wav をランダムで voice ソースに流す。"""
+        data = await self._request(
+            "POST", "/api/filler/play", {"category": category, "style": style}
+        )
+        if data:
+            return data.get("result", f"Filler {category} queued")
+        return f"Error: Failed to play filler {category}"
+
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""
         url = f"{self.base_url}/health"
