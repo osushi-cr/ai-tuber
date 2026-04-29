@@ -113,6 +113,29 @@ class BodyClient:
             return data.get("result", "Wait completed")
         return "Error: Failed to wait for queue"
 
+    async def switch_bgm(self, bgm_id: str) -> str:
+        """指定 BGM へ切替（他のループ系 BGM は停止）。"""
+        data = await self._request("POST", "/api/bgm/switch", {"bgm_id": bgm_id})
+        if data:
+            return data.get("result", f"BGM switched to {bgm_id}")
+        return f"Error: Failed to switch BGM to {bgm_id}"
+
+    async def play_bgm(self, bgm_id: str, restart: bool = True) -> str:
+        """指定 BGM を表示・先頭から再生。SE のような単発再生にも使う。"""
+        data = await self._request(
+            "POST", "/api/bgm/play", {"bgm_id": bgm_id, "restart": restart}
+        )
+        if data:
+            return data.get("result", f"BGM {bgm_id} started")
+        return f"Error: Failed to play BGM {bgm_id}"
+
+    async def stop_bgm(self, bgm_id: str) -> str:
+        """指定 BGM ソースを非表示・停止する。"""
+        data = await self._request("POST", "/api/bgm/stop", {"bgm_id": bgm_id})
+        if data:
+            return data.get("result", f"BGM {bgm_id} stopped")
+        return f"Error: Failed to stop BGM {bgm_id}"
+
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""
         url = f"{self.base_url}/health"

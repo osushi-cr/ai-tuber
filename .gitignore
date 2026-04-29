@@ -29,6 +29,12 @@ google_client_secret.json
 yt_token.json
 dashboard/gcp-creds.json
 gcp-creds.json
+data/youtube_client_secret.json
+data/youtube_token.json
+.envrc
+
+# BGM / SE 音源（リポ肥大化を避けるため別管理）
+data/mind/*/assets/bgm/
 
 # OBS temp files
 *.lock

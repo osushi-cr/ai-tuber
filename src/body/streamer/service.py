@@ -1,5 +1,7 @@
 """MCP tools for body-streamer service"""
 import os
+import random
+from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
 import json
@@ -20,6 +22,15 @@ from . import obs_adapter
 from ..service import BodyServiceBase
 
 logger = logging.getLogger(__name__)
+
+
+# フィラー音声（相槌・思考・繋ぎ等）の wav ライブラリのパス。
+# voice_library/kurara/presets/ には filler_<category>_<variant>.wav 命名で配置されている。
+# 主な category: aizuchi（相槌） / thinking（考え中） / reaction（驚き） / intro（出だし） / outro（締め）
+FILLER_VOICE_DIR = Path(os.getenv(
+    "FILLER_VOICE_DIR",
+    str(Path.home() / "src/personal/Irodori-TTS/voice_library/kurara/presets")
+))
 
 
 class StreamerBodyService(BodyServiceBase):
@@ -105,7 +116,20 @@ class StreamerBodyService(BodyServiceBase):
                         logger.info(f"[Worker:emotion] Changed to {emotion}")
                     except Exception as e:
                         logger.error(f"Error in worker emotion task: {e}")
-                
+
+                elif task_type == "filler":
+                    file_path = task.get("file_path")
+                    style = task.get("style", "neutral")
+                    try:
+                        import wave
+                        with wave.open(file_path, "rb") as w:
+                            duration = w.getnframes() / float(w.getframerate())
+                        await self.play_audio_with_sync_emotion(file_path, duration, style)
+                        await obs_adapter.set_visible_source("silent")
+                        logger.info(f"[Worker:filler] Completed: {Path(file_path).name}")
+                    except Exception as e:
+                        logger.error(f"Error in worker filler task: {e}")
+
                 self._action_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -132,6 +156,41 @@ class StreamerBodyService(BodyServiceBase):
         })
         logger.info(f"[change_emotion:queued] {emotion}")
         return "Emotion change queued"
+
+    async def play_filler(self, category: str, style: str = "neutral") -> str:
+        """category 該当の filler wav をランダム選択して voice ソースで再生します。
+
+        category: "aizuchi" / "thinking" / "reaction" / "intro" / "outro" 等。
+        FILLER_VOICE_DIR 配下の `filler_<category>_*.wav` から1つランダム選択する。
+        """
+        if not FILLER_VOICE_DIR.exists():
+            return f"FILLER_VOICE_DIR not found: {FILLER_VOICE_DIR}"
+        candidates = sorted(FILLER_VOICE_DIR.glob(f"filler_{category}_*.wav"))
+        if not candidates:
+            return f"No filler wav found for category: {category}"
+        chosen = random.choice(candidates)
+        await self._action_queue.put({
+            "type": "filler",
+            "file_path": str(chosen),
+            "style": style,
+        })
+        logger.info(f"[filler:queued] category={category} file={chosen.name}")
+        return f"Filler queued: {chosen.name}"
+
+    async def play_bgm(self, bgm_id: str, restart: bool = True) -> str:
+        """BGM ソースを表示し再生します（obs_adapter のラッパー）。"""
+        ok = await obs_adapter.play_bgm(bgm_id, restart=restart)
+        return f"BGM '{bgm_id}' started" if ok else f"Failed to play BGM '{bgm_id}'"
+
+    async def stop_bgm(self, bgm_id: str) -> str:
+        """BGM ソースを非表示にして停止します（obs_adapter のラッパー）。"""
+        ok = await obs_adapter.stop_bgm(bgm_id)
+        return f"BGM '{bgm_id}' stopped" if ok else f"Failed to stop BGM '{bgm_id}'"
+
+    async def switch_bgm(self, bgm_id: str) -> str:
+        """指定BGMへ切替（他のループ系BGMを停止）し、SE は触りません。"""
+        ok = await obs_adapter.switch_bgm(bgm_id)
+        return f"BGM switched to '{bgm_id}'" if ok else f"Failed to switch BGM to '{bgm_id}'"
 
     async def get_comments(self) -> str:
         """コメントを取得します（YouTube live chat ＋ ダミー注入分の両方）。"""
@@ -280,36 +339,75 @@ class StreamerBodyService(BodyServiceBase):
         )
         
         stream_key = live_response['stream']['cdn']['ingestionInfo']['streamName']
+        stream_id = live_response['stream']['id']
         self._current_broadcast_id = live_response['broadcast']['id']
-        
+
         logger.info("Starting OBS streaming with YouTube stream key")
         success = await obs_adapter.start_streaming(stream_key)
-        
+
         if not success:
             return "OBSストリーミングの開始に失敗しました。"
-        
+
+        # OBS から RTMP が届いて liveStream が active になるのを待ってから broadcast を live に遷移する。
+        # この遷移を行わないと broadcast は status=ready のまま視聴者には公開されない。
+        try:
+            became_active = await asyncio.to_thread(
+                self._youtube_live_adapter.wait_for_stream_active,
+                youtube_client, stream_id, 30
+            )
+            if became_active:
+                self._youtube_live_adapter.start_live(youtube_client, self._current_broadcast_id)
+                logger.info(f"Transitioned broadcast {self._current_broadcast_id} to live")
+            else:
+                logger.warning(
+                    f"liveStream did not become active within 30s. broadcast {self._current_broadcast_id} stays in 'ready'. "
+                    "YouTube Studio で手動「配信を開始」が必要。"
+                )
+        except Exception as e:
+            logger.error(f"Failed to transition broadcast to live: {e}")
+
         from .youtube_comment_adapter import YouTubeCommentAdapter
         self._youtube_comment_adapter = YouTubeCommentAdapter(self._current_broadcast_id)
-        
+
         logger.info(f"[start_streaming] Success - Broadcast ID: {self._current_broadcast_id}")
         return f"YouTube Live配信を開始しました。ブロードキャストID: {self._current_broadcast_id}"
 
     async def _stop_streaming(self) -> str:
-        """YouTube Live 配信を停止する内部関数。"""
-        logger.info("Stopping OBS streaming")
-        await obs_adapter.stop_streaming()
-        
+        """YouTube Live 配信を停止する内部関数。
+
+        OBS Stop と YouTube transition('complete') と CommentAdapter close は
+        互いに独立した責務なので、いずれかが失敗しても他は確実に実行されるように
+        個別に try/except で囲む（quota 超過時に OBS が止まらない事故を防ぐ）。
+        """
+        # 1. OBS の RTMP 送信を確実に止める（一番優先度が高い）
+        try:
+            logger.info("Stopping OBS streaming")
+            await obs_adapter.stop_streaming()
+        except Exception as e:
+            logger.error(f"Failed to stop OBS streaming: {e}")
+
+        # 2. YouTube broadcast を complete に遷移（quota 超過等で失敗しても OBS は既に止まっている）
         if self._youtube_live_adapter and self._current_broadcast_id:
-            youtube_client, _ = self._youtube_live_adapter.authenticate_youtube()
-            self._youtube_live_adapter.stop_live(youtube_client, self._current_broadcast_id)
-            logger.info(f"Stopped YouTube broadcast: {self._current_broadcast_id}")
-        
+            try:
+                youtube_client, _ = self._youtube_live_adapter.authenticate_youtube()
+                self._youtube_live_adapter.stop_live(youtube_client, self._current_broadcast_id)
+                logger.info(f"Stopped YouTube broadcast: {self._current_broadcast_id}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to transition broadcast {self._current_broadcast_id} to 'complete': {e}. "
+                    "YouTube Studio で手動「配信を終了」が必要かもしれません。"
+                )
+
+        # 3. コメント取得サブプロセスを終了
         if self._youtube_comment_adapter:
-            self._youtube_comment_adapter.close()
+            try:
+                self._youtube_comment_adapter.close()
+            except Exception as e:
+                logger.error(f"Failed to close YouTubeCommentAdapter: {e}")
             self._youtube_comment_adapter = None
-        
+
         self._current_broadcast_id = None
-        
+
         logger.info("[stop_streaming] Success")
         return "YouTube Live配信を停止しました。"
 

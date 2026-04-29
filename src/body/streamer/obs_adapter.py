@@ -361,6 +361,81 @@ async def get_streaming_status() -> bool:
         logger.error(f"Error getting OBS streaming status: {e}")
         return False
 
+BGM_SOURCES = {
+    "chitchat": "bgm_loop_chitchat",
+    "news": "bgm_loop_news",
+    "op": "bgm_op",
+    "ed": "bgm_ed",
+    "se": "bgm_se_transition",
+}
+
+
+async def play_bgm(bgm_id: str, restart: bool = True) -> bool:
+    """指定BGMを表示し、必要なら先頭から再生する。"""
+    source = BGM_SOURCES.get(bgm_id)
+    if source is None:
+        logger.warning(f"Unknown bgm_id: {bgm_id}")
+        return False
+    if not await connect():
+        return False
+
+    await set_source_visibility(source, True)
+    if restart:
+        try:
+            ws_client.call(obs_requests.TriggerMediaInputAction(
+                inputName=source,
+                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to restart bgm '{source}': {e}")
+    logger.info(f"play_bgm: {bgm_id} ({source}, restart={restart})")
+    return True
+
+
+async def stop_bgm(bgm_id: str) -> bool:
+    """指定BGMを非表示にして停止する。"""
+    source = BGM_SOURCES.get(bgm_id)
+    if source is None:
+        logger.warning(f"Unknown bgm_id: {bgm_id}")
+        return False
+    ok = await set_source_visibility(source, False)
+    if ok:
+        logger.info(f"stop_bgm: {bgm_id} ({source})")
+    return ok
+
+
+async def switch_bgm(to_id: str) -> bool:
+    """指定BGMを再生し、他のループ系BGM（op/ed/chitchat/news）を停止する。SEは触らない。"""
+    target = BGM_SOURCES.get(to_id)
+    if target is None:
+        logger.warning(f"Unknown bgm_id: {to_id}")
+        return False
+    if not await connect():
+        return False
+
+    await set_source_visibility(target, True)
+    try:
+        ws_client.call(obs_requests.TriggerMediaInputAction(
+            inputName=target,
+            mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+        ))
+    except Exception as e:
+        logger.warning(f"Failed to restart bgm '{target}': {e}")
+
+    for bgm_id, source in BGM_SOURCES.items():
+        if bgm_id == to_id or bgm_id == "se":
+            continue
+        await set_source_visibility(source, False)
+
+    logger.info(f"switch_bgm: -> {to_id}")
+    return True
+
+
+async def play_se() -> bool:
+    """シーン切替SEを単発再生する（再生終了時の自動非表示はOBS側設定に依存）。"""
+    return await play_bgm("se", restart=True)
+
+
 async def play_media_with_emotion(audio_source: str, file_path: str, emotion: str) -> bool:
     """
     音声の再生開始と表情の切り替えを、可能な限り同時に実行します。

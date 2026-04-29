@@ -5,6 +5,7 @@ BroadcastPhase (Enum) と各フェーズのハンドラで構成されます。
 各ハンドラは BroadcastContext を受け取り、次の BroadcastPhase を返します。
 """
 import asyncio
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -138,16 +139,58 @@ _HANDLERS = {
     BroadcastPhase.CLOSING: handle_closing,
 }
 
+# フェーズと BGM の対応。 obs_adapter.BGM_SOURCES の bgm_id と一致させる。
+_PHASE_BGM = {
+    BroadcastPhase.INTRO:   "op",
+    BroadcastPhase.NEWS:    "news",
+    BroadcastPhase.IDLE:    "chitchat",
+    BroadcastPhase.CLOSING: "ed",
+}
+
+# 切替 SE が鳴り終わるまで次の BGM 切替を遅らせる秒数。
+# SE と次のBGMが同時再生にならないよう、bgm_se_transition の長さに合わせる。
+_SE_HOLD_SECONDS = float(os.getenv("BROADCAST_SE_HOLD_SECONDS", "2.0"))
+
+
+async def _switch_bgm_for_phase(
+    ctx: BroadcastContext, phase: BroadcastPhase, *, with_se: bool = False
+) -> None:
+    """フェーズに対応する BGM へ切替する。失敗してもループは継続させる。
+
+    `with_se=True` の場合はシーン切替 SE を先に鳴らしてから BGM を切り替える。
+    通常はフェーズ遷移時のみ True、配信開始の最初の INTRO 投入時は False で呼ぶ。
+    """
+    bgm_id = _PHASE_BGM.get(phase)
+    if not bgm_id:
+        return
+    if with_se:
+        try:
+            await ctx.saint_graph.body.play_bgm("se")
+            # SE が鳴り終わるまで次の BGM 切替を遅らせる（同時再生回避）
+            await asyncio.sleep(_SE_HOLD_SECONDS)
+            # switch_bgm は SE を停止しない（設計上）ため、明示的に SE を止める
+            await ctx.saint_graph.body.stop_bgm("se")
+        except Exception as e:
+            logger.warning(f"Failed to play transition SE: {e}")
+    try:
+        await ctx.saint_graph.body.switch_bgm(bgm_id)
+    except Exception as e:
+        logger.warning(f"Failed to switch BGM for phase {phase.value}: {e}")
+
 
 async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     """
     ステートマシンのメインループ。
 
     INTRO から始まり、各ハンドラが返す次フェーズに従って遷移します。
+    フェーズ遷移時に対応 BGM へ切り替えます。
     ハンドラが None を返すとループを終了します。
     """
     phase = BroadcastPhase.INTRO
     logger.info("Entering Broadcast Loop (state machine)...")
+
+    # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
+    await _switch_bgm_for_phase(ctx, phase, with_se=False)
 
     while phase is not None:
         try:
@@ -157,6 +200,8 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
             if next_phase is not None:
                 if next_phase != phase:
                     logger.info(f"Phase transition: {phase.value} -> {next_phase.value}")
+                    # フェーズ遷移時はシーン切替 SE を入れて BGM を切り替える
+                    await _switch_bgm_for_phase(ctx, next_phase, with_se=True)
                 phase = next_phase
                 await asyncio.sleep(POLL_INTERVAL)
             else:

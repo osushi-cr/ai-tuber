@@ -135,6 +135,33 @@ class YoutubeLiveAdapter:
         logger.info(f"Bound broadcast {broadcast_id} to stream {stream_id}")
         return bind_response
 
+    def wait_for_stream_active(self, youtube, stream_id: str, timeout_sec: int = 30) -> bool:
+        """OBS から RTMP データが届いて stream の status が active になるまで待機する。"""
+        import time
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            resp = youtube.liveStreams().list(part="status", id=stream_id).execute()
+            items = resp.get("items", [])
+            if items:
+                stream_status = items[0].get("status", {}).get("streamStatus")
+                logger.info(f"liveStream {stream_id} status: {stream_status}")
+                if stream_status == "active":
+                    return True
+            time.sleep(2)
+        logger.warning(f"liveStream {stream_id} did not become active within {timeout_sec}s")
+        return False
+
+    def start_live(self, youtube, broadcast_id: str) -> Dict:
+        """broadcast を live に遷移させて視聴可能にする。"""
+        res = youtube.liveBroadcasts().transition(
+            broadcastStatus="live",
+            id=broadcast_id,
+            part="id,status"
+        ).execute()
+
+        logger.info(f"Started live broadcast: {broadcast_id}")
+        return res
+
     def stop_live(self, youtube, broadcast_id: str) -> Dict:
         """Stop a live broadcast on YouTube."""
         res = youtube.liveBroadcasts().transition(
