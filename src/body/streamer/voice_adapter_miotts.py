@@ -27,7 +27,8 @@ _ALPHABET_KATAKANA = {
     "U": "ユー", "V": "ブイ", "W": "ダブリュー", "X": "エックス", "Y": "ワイ",
     "Z": "ゼット",
 }
-# よく出る固有表現は専用読み（長い順に揃える）
+# よく出る固有表現は専用読み。短い略語が長い略語の接頭辞になるケース（"AI" vs "AIO" 等）の
+# 衝突を避けるため、適用時は文字数の長い順に置換する（_COMMON_ABBREVS_SORTED を使用）。
 _COMMON_ABBREVS = [
     ("YouTube", "ユーチューブ"),
     ("ChatGPT", "チャットジーピーティー"),
@@ -44,7 +45,18 @@ _COMMON_ABBREVS = [
     ("AI", "エーアイ"),
     ("CPU", "シーピーユー"),
     ("GPU", "ジーピーユー"),
+    # ニュース読み上げで頻出する固有名詞（カタカナ読み確定が必要なもの）
+    ("VTuber", "ブイチューバー"),
+    ("YouTuber", "ユーチューバー"),
+    ("NVIDIA", "エヌビディア"),
+    ("DAM", "ダム"),
+    ("ETF", "イーティーエフ"),
+    ("SEO", "エスイーオー"),
+    ("GEO", "ジーイーオー"),
+    ("AIO", "エーアイオー"),
+    ("S&P500", "エスアンドピーゴヒャク"),
 ]
+_COMMON_ABBREVS_SORTED = sorted(_COMMON_ABBREVS, key=lambda x: -len(x[0]))
 
 
 # 絵文字（ピクトグラム / シンボル / 装飾）も学習データ外で MioTTS-0.1B が暴走するため除去する。
@@ -60,31 +72,101 @@ _EMOJI_PATTERN = re.compile(
 )
 
 
+# 1桁数字をTTS読みに変換するテーブル。"〇" は MioTTS が「まる」と読み揺れするため
+# 「ゼロ」カタカナで固定読みにする。整数部の途中ゼロは _kanji_int 側で skip されるため、
+# このテーブルは小数部や 0 単独のときだけ使われる。
+_KANJI_DIGITS = ["ゼロ", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+_KANJI_SMALL_UNITS = ["", "十", "百", "千"]
+_KANJI_BIG_UNITS = ["", "万", "億", "兆", "京"]
+
+
+def _kanji_int(n: int) -> str:
+    """正の整数を日本語漢数字表記へ変換する（4桁ごとに万・億…付与、"1"は十百千の前で省略）。"""
+    if n == 0:
+        return "ゼロ"
+    s = str(n)
+    groups: list[str] = []
+    while s:
+        groups.append(s[-4:])
+        s = s[:-4]
+    parts: list[str] = []
+    for i, g in enumerate(groups):
+        if int(g) == 0:
+            continue
+        chunk = ""
+        for j, ch in enumerate(g):
+            d = int(ch)
+            pos = len(g) - 1 - j
+            if d == 0:
+                continue
+            if d == 1 and pos > 0:
+                chunk += _KANJI_SMALL_UNITS[pos]
+            else:
+                chunk += _KANJI_DIGITS[d] + _KANJI_SMALL_UNITS[pos]
+        parts.append(chunk + _KANJI_BIG_UNITS[i])
+    return "".join(reversed(parts))
+
+
+def _kanji_decimal(int_part: str, dec_part: str) -> str:
+    """小数を「整数部の漢数字 + 点 + 小数部の一桁ずつ漢数字」に変換する。"""
+    int_kanji = _kanji_int(int(int_part))
+    dec_kanji = "".join(_KANJI_DIGITS[int(c)] for c in dec_part)
+    return f"{int_kanji}点{dec_kanji}"
+
+
+def _normalize_numbers_and_symbols(text: str) -> str:
+    """ニュース原稿で頻出する数値・記号をTTSが読みやすい表記に正規化する。
+
+    - 桁区切りカンマ削除: "11,797,933" → "11797933"（後段で漢数字化）
+    - 符号: 数字直前の "+" "-" → "プラス" "マイナス"
+    - パーセント / アンパサンド / 全角イコール / ドル → カナ
+    - 小数: "6917.81" → "六千九百十七点八一"（一桁ずつ）
+    - 整数: "54293" → "五万四千二百九十三"
+    """
+    text = re.sub(r"(?<=\d),(?=\d{3})", "", text)
+    text = re.sub(r"(?<![\d.])\+(?=\d)", "プラス", text)
+    text = re.sub(r"(?<![\d.])\-(?=\d)", "マイナス", text)
+    text = text.replace("%", "パーセント").replace("％", "パーセント")
+    text = text.replace("&", "アンド").replace("＆", "アンド")
+    text = text.replace("＝", "イコール")
+    text = text.replace("$", "ドル")
+    text = re.sub(r"(\d+)\.(\d+)", lambda m: _kanji_decimal(m.group(1), m.group(2)), text)
+    # 単桁整数（"1ドル" "2月" 等）は漢数字化しない。漢数字「一」は MioTTS が「ひと」読みに揺れるため、
+    # アラビア数字のままにして「いち / に」と読ませる。2桁以上の整数だけ漢数字化する。
+    text = re.sub(r"\d{2,}", lambda m: _kanji_int(int(m.group(0))), text)
+    return text
+
+
 def _normalize_text(text: str) -> str:
-    """MioTTS-0.1B が暴走しないようテキストを正規化する。
+    """MioTTS が暴走しないよう & TTSが正しく読めるようテキストを正規化する。
 
     - 絵文字除去
-    - 波ダッシュ「〜」→伸ばし棒「ー」
+    - 波ダッシュ削除（「みんな〜」→「みんな」、「ー」変換だと音声崩壊）
     - 半角・全角空白除去（日本語テキストとして不自然＋暴走トリガーになる）
     - 感嘆符・疑問符（！？!?）を句点「。」に統一（混在で暴走するため）
     - 連続「。」を1つに圧縮
-    - 既知略語をカタカナ化
+    - 数値・記号正規化（カンマ削除・%・±符号・&・＝・$）
+    - 既知略語・固有名詞をカタカナ化
     - 残った2文字以上の連続英字をアルファベット読み
     """
     text = _EMOJI_PATTERN.sub("", text)
-    # 波ダッシュは伸ばし棒変換ではなく削除（「みんな〜」→「みんな」、「ー」変換だと音声崩壊）
     text = text.replace("〜", "").replace("～", "")
     text = text.replace(" ", "").replace("　", "")
-    # 感嘆符・疑問符を句点に統一（！と？混在で暴走するため）
     text = re.sub(r"[！？!?]", "。", text)
     text = re.sub(r"。+", "。", text)
-    for abbrev, kana in _COMMON_ABBREVS:
+    # COMMON_ABBREVS は数値・記号正規化より先に適用する（"S&P500" のような記号入り略語が
+    # "&" → "アンド" 置換で拾えなくなるのを防ぐ）。長い順で置換することで "AI" / "AIO" の
+    # ような接頭辞衝突（"AIO" が "AI"+"O" と先取りされるケース）も回避する。
+    for abbrev, kana in _COMMON_ABBREVS_SORTED:
         text = text.replace(abbrev, kana)
-    text = re.sub(
-        r"[A-Za-z]{2,}",
-        lambda m: "".join(_ALPHABET_KATAKANA.get(c.upper(), c) for c in m.group(0)),
-        text,
-    )
+    text = _normalize_numbers_and_symbols(text)
+    # COMMON_ABBREVS にヒットしなかった連続英字は削除する。アルファベット読みに展開すると
+    # "Superlative" → "エスユーピーイーアールエル..." のように一般英単語までスペル読みされて
+    # 視聴者には読み間違いに聞こえるため。原稿生成側（Gemini）で英語タイトル・固有名詞を
+    # カタカナ表記する規約を持たせ、漏れた英字はサイレントに落とすセーフティネット運用。
+    text = re.sub(r"[A-Za-z]+", "", text)
+    # 英字削除で空になった鉤括弧ペアを除去（"より「」、" のような不自然な並びがTTSで暴走/崩壊するため）
+    text = re.sub(r"「」|『』|\(\)|（）|【】|《》|〈〉", "", text)
     return text
 
 
