@@ -1,5 +1,6 @@
 """YouTube Live comment adapter using subprocess"""
 import subprocess
+import sys
 import threading
 import queue
 import os
@@ -12,22 +13,24 @@ logger = logging.getLogger(__name__)
 
 class YouTubeCommentAdapter:
     """Adapter for fetching YouTube Live comments using subprocess"""
-    
+
     def __init__(self, video_id: str):
         """
         Initialize the comment adapter.
-        
+
         Args:
             video_id: YouTube video/broadcast ID
         """
-        # Run the fetcher as a module to handle imports correctly
+        # 親 body-streamer と同じ Python（venv の googleapiclient/google-auth が見える）で
+        # サブプロセスを起動する。`python` リテラルだとシステム Python に解決されて
+        # ai-tuber の .venv が見えず ModuleNotFoundError で即死する。
         self.process = subprocess.Popen(
-            ['python', '-m', 'body.streamer.youtube_comment_fetcher', video_id], 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True, 
+            [sys.executable, '-m', 'body.streamer.youtube_comment_fetcher', video_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             bufsize=1,
-            env=os.environ.copy()  # 環境変数を子プロセスに渡す（YOUTUBE_API_KEY等）
+            env=os.environ.copy()  # 環境変数を子プロセスに渡す（YOUTUBE_TOKEN_JSON等）
         )
         self.q: queue.Queue = queue.Queue()
         self.error_q: queue.Queue = queue.Queue()
