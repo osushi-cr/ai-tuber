@@ -145,6 +145,13 @@ class BodyClient:
             return data.get("result", f"Filler {category} queued")
         return f"Error: Failed to play filler {category}"
 
+    async def register_chitchat_lines(self, lines: List[str]) -> str:
+        """雑談セリフリストを body-streamer に登録し、auto-filler に混ぜる。"""
+        data = await self._request("POST", "/api/chitchat/register", {"lines": lines})
+        if data:
+            return data.get("result", f"Registered {len(lines)} chitchat lines")
+        return "Error: Failed to register chitchat lines"
+
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""
         url = f"{self.base_url}/health"

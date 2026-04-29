@@ -1,6 +1,7 @@
 """MCP tools for body-streamer service"""
 import os
 import random
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
@@ -47,6 +48,12 @@ class StreamerBodyService(BodyServiceBase):
         # In production this is empty and YouTube live chat fills the response.
         self._dummy_comments: list[dict] = []
         self._dummy_comment_seq = 0
+        # 自動 filler ループ用: 直近の voice 再生終了時刻（broadcast 中の沈黙監視）
+        self._last_audio_end_time = 0.0
+        self._broadcasting = False
+        self._auto_filler_task = None
+        # idle 中に saint_graph から事前登録された雑談セリフを混ぜる用
+        self._chitchat_pool: list[str] = []
 
     async def inject_comment(self, author: str, message: str) -> str:
         """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
@@ -223,24 +230,78 @@ class StreamerBodyService(BodyServiceBase):
     async def _execute_actual_broadcast_start(self, config: Dict[str, Any]) -> str:
         """実際に配信または録画を開始する内部メソッド。"""
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
-        
+
         try:
             if streaming_mode:
                 result = await self._start_streaming(config)
                 # ストリーミング開始後の安定化待機（YouTube側にデータが届き始めるまで数秒待つ）
                 await asyncio.sleep(3)
-                return result
             else:
                 result = await self.start_obs_recording()
                 # OBS録画開始後の安定化待機
                 await asyncio.sleep(2)
-                return result
+
+            # 配信中の沈黙を埋める自動 filler ループを起動
+            self._broadcasting = True
+            self._last_audio_end_time = time.time()
+            if self._auto_filler_task is None or self._auto_filler_task.done():
+                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
+                logger.info("Auto-filler loop started")
+            return result
         except Exception as e:
             logger.error(f"Error in _execute_actual_broadcast_start: {e}")
             return f"配信開始エラー: {str(e)}"
 
+    async def _auto_filler_loop(self):
+        """配信中、voice 再生していない idle が閾値超えたら filler / chitchat を自動投入する。
+
+        - `FILLER_AUTO_IDLE_SECONDS`（既定2.0秒）以上 idle になったら投入
+        - `FILLER_AUTO_INTERVAL`（既定2.0秒）毎にチェック
+        - filler カテゴリ（aizuchi/thinking/reaction）と chitchat（雑談セリフ）を交互に巡回
+        - キューに何か積まれている間は投入しない（saint_graph 本セリフを優先）
+        """
+        idle_threshold = float(os.getenv("FILLER_AUTO_IDLE_SECONDS", "2.0"))
+        interval = float(os.getenv("FILLER_AUTO_INTERVAL", "2.0"))
+        categories = ["aizuchi", "thinking", "reaction"]
+        i = 0
+        while self._broadcasting:
+            await asyncio.sleep(interval)
+            if not self._broadcasting:
+                break
+            if not self._action_queue.empty():
+                continue
+            idle = time.time() - self._last_audio_end_time
+            if idle < idle_threshold:
+                continue
+            # chitchat_pool が空なら filler のみ。pool ありなら filler/chitchat を交互に。
+            if self._chitchat_pool and i % 2 == 1:
+                line = random.choice(self._chitchat_pool)
+                try:
+                    await self.speak(line, style="neutral")
+                    logger.info(f"[auto-filler:chitchat] '{line}'")
+                except Exception as e:
+                    logger.warning(f"Auto-filler chitchat failed: {e}")
+            else:
+                cat = categories[(i // 2) % len(categories)] if self._chitchat_pool else categories[i % len(categories)]
+                try:
+                    await self.play_filler(cat)
+                except Exception as e:
+                    logger.warning(f"Auto-filler failed ({cat}): {e}")
+            i += 1
+        logger.info("Auto-filler loop exited")
+
+    async def register_chitchat_lines(self, lines: list) -> str:
+        """saint_graph 等から雑談セリフのリストを登録し、auto-filler に混ぜる。"""
+        cleaned = [s for s in lines if isinstance(s, str) and s.strip()]
+        self._chitchat_pool = cleaned
+        logger.info(f"[chitchat] registered {len(cleaned)} chitchat lines")
+        return f"Registered {len(cleaned)} chitchat lines"
+
     async def stop_broadcast(self) -> str:
         """配信または録画を停止します。"""
+        # 自動 filler ループを止める（残発話完了待ち中に新規 filler が積まれないようにする）
+        self._broadcasting = False
+
         # すべての発話が完了するまで待機してから停止する
         await self.wait_for_queue()
 
@@ -251,7 +312,7 @@ class StreamerBodyService(BodyServiceBase):
         await asyncio.sleep(stop_delay)
 
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
-        
+
         try:
             if streaming_mode:
                 return await self._stop_streaming()
@@ -279,6 +340,9 @@ class StreamerBodyService(BodyServiceBase):
 
             # 再生完了まで待機
             await asyncio.sleep(duration + 0.1)
+
+            # 自動 filler ループが「voice 再生していない idle 時間」を測るための基準時刻
+            self._last_audio_end_time = time.time()
 
             logger.info(f"[play_audio_sync] Completed playback ({duration:.1f}s)")
             return f"再生完了 ({duration:.1f}s)"

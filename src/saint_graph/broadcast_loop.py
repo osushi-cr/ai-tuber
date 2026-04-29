@@ -209,6 +209,9 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     phase = BroadcastPhase.INTRO
     logger.info("Entering Broadcast Loop (state machine)...")
 
+    # 雑談セリフを body-streamer に登録（auto-filler が idle 時に混ぜる）
+    await ctx.saint_graph.register_chitchat()
+
     # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
     await _switch_bgm_for_phase(ctx, phase, with_se=False)
 

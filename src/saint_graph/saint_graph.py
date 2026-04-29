@@ -100,6 +100,37 @@ class SaintGraph:
         template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
         await self.process_turn(template, context="QA")
 
+    # 沈黙埋め用の定数雑談セリフ（Gemini 不要・即動作）。voice_adapter で
+    # 正規化されるので絵文字・英字は使わず、10-25字の短文で揃える。
+    _CHITCHAT_LINES = [
+        "お兄ちゃん、コメント待ってるよ〜",
+        "今日も配信できて、くらら嬉しいな",
+        "みんな〜、声届いてる？",
+        "えっとね、なんか喋りたい気分なの",
+        "コメントくれたら、すっごい喜ぶよ",
+        "お兄ちゃん、ちゃんとお水飲んでる？",
+        "今日のニュース、どれが気になった？",
+        "ふと、お兄ちゃんの顔が見たくなっちゃった",
+        "みんな、ちゃんと休んでる？",
+        "ねえ、くらら、ちゃんと聞こえてる？",
+        "最近お兄ちゃんと話せて、楽しいな",
+        "コメント募集中だよ〜",
+        "お兄ちゃん、いつもありがとう",
+        "えへへ、なんでもないよ",
+        "一緒に過ごせて、ほんとに嬉しい",
+    ]
+
+    async def register_chitchat(self):
+        """雑談セリフのリストを body-streamer に登録し、auto-filler に混ぜる。
+
+        broadcast_loop の開始時に呼ぶと、idle 時に filler と交互に雑談セリフが流れる。
+        """
+        try:
+            await self.body.register_chitchat_lines(self._CHITCHAT_LINES)
+            logger.info(f"[chitchat] registered {len(self._CHITCHAT_LINES)} lines to body-streamer")
+        except Exception as e:
+            logger.warning(f"Failed to register chitchat lines: {e}")
+
     # --- メインターン処理 ---
 
     async def process_turn(self, user_input: str, context: Optional[str] = None):

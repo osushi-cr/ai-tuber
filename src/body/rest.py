@@ -148,6 +148,19 @@ class BodyApp:
             logger.error(f"Error in filler/play API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def chitchat_register_api(self, request: Request) -> JSONResponse:
+        """雑談セリフのリストを登録し、auto-filler ループに混ぜる。"""
+        try:
+            body = await request.json()
+            lines = body.get("lines", [])
+            if not isinstance(lines, list):
+                return JSONResponse({"status": "error", "message": "'lines' must be a list"}, status_code=400)
+            result = await self.service.register_chitchat_lines(lines)
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in chitchat/register API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     def get_routes(self) -> list[Route]:
         """共通のルート定義を返します。"""
         return [
@@ -163,4 +176,5 @@ class BodyApp:
             Route("/api/bgm/play", self.bgm_play_api, methods=["POST"]),
             Route("/api/bgm/stop", self.bgm_stop_api, methods=["POST"]),
             Route("/api/filler/play", self.filler_play_api, methods=["POST"]),
+            Route("/api/chitchat/register", self.chitchat_register_api, methods=["POST"]),
         ]
