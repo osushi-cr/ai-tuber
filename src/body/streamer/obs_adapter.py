@@ -436,6 +436,23 @@ async def play_se() -> bool:
     return await play_bgm("se", restart=True)
 
 
+async def switch_scene(scene_name: str) -> bool:
+    """OBS のプログラムシーンを切り替える。配信待ち画面・配信本編・終了画面の遷移用。"""
+    global _current_scene_name, _source_id_cache
+    if not await connect():
+        return False
+    try:
+        ws_client.call(obs_requests.SetCurrentProgramScene(sceneName=scene_name))
+        # シーン切替時はソース ID キャッシュをクリア（シーンごとにアイテム ID が異なる）
+        _current_scene_name = scene_name
+        _source_id_cache = {}
+        logger.info(f"switch_scene: -> {scene_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Error switching to scene '{scene_name}': {e}")
+        return False
+
+
 async def play_media_with_emotion(audio_source: str, file_path: str, emotion: str) -> bool:
     """
     音声の再生開始と表情の切り替えを、可能な限り同時に実行します。

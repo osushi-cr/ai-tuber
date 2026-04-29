@@ -161,6 +161,19 @@ class BodyApp:
             logger.error(f"Error in chitchat/register API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def scene_switch_api(self, request: Request) -> JSONResponse:
+        """OBS のプログラムシーンを切り替える（waiting / kurara_main / ending 等）。"""
+        try:
+            body = await request.json()
+            scene_name = body.get("scene")
+            if not scene_name:
+                return JSONResponse({"status": "error", "message": "missing 'scene'"}, status_code=400)
+            result = await self.service.switch_scene(scene_name)
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in scene/switch API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     def get_routes(self) -> list[Route]:
         """共通のルート定義を返します。"""
         return [
@@ -177,4 +190,5 @@ class BodyApp:
             Route("/api/bgm/stop", self.bgm_stop_api, methods=["POST"]),
             Route("/api/filler/play", self.filler_play_api, methods=["POST"]),
             Route("/api/chitchat/register", self.chitchat_register_api, methods=["POST"]),
+            Route("/api/scene/switch", self.scene_switch_api, methods=["POST"]),
         ]

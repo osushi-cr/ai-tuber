@@ -152,6 +152,13 @@ class BodyClient:
             return data.get("result", f"Registered {len(lines)} chitchat lines")
         return "Error: Failed to register chitchat lines"
 
+    async def switch_scene(self, scene_name: str) -> str:
+        """OBS のプログラムシーンを切り替える。"""
+        data = await self._request("POST", "/api/scene/switch", {"scene": scene_name})
+        if data:
+            return data.get("result", f"Scene switched to {scene_name}")
+        return f"Error: Failed to switch scene to {scene_name}"
+
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""
         url = f"{self.base_url}/health"

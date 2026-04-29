@@ -140,11 +140,18 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
 async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     """CLOSING: 締めの挨拶をしてリソースを解放する。None を返しループ終了。"""
     await ctx.saint_graph.process_closing()
-    
+
     # すべての発話が完了するまで待機（キューの消化待機）
     logger.info("Waiting for final speech to complete...")
     await ctx.saint_graph.body.wait_for_queue()
-    
+
+    # 配信終了画面へシーン切替（ending イラスト＋BGM）
+    try:
+        ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")
+        await ctx.saint_graph.body.switch_scene(ending_scene)
+    except Exception as e:
+        logger.warning(f"Failed to switch to ending scene: {e}")
+
     return None  # ループ終了のシグナル
 
 

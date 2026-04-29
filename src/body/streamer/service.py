@@ -199,6 +199,11 @@ class StreamerBodyService(BodyServiceBase):
         ok = await obs_adapter.switch_bgm(bgm_id)
         return f"BGM switched to '{bgm_id}'" if ok else f"Failed to switch BGM to '{bgm_id}'"
 
+    async def switch_scene(self, scene_name: str) -> str:
+        """OBS のプログラムシーンを切り替える（waiting / kurara_main / ending 等）。"""
+        ok = await obs_adapter.switch_scene(scene_name)
+        return f"Scene switched to '{scene_name}'" if ok else f"Failed to switch scene to '{scene_name}'"
+
     async def get_comments(self) -> str:
         """コメントを取得します（YouTube live chat ＋ ダミー注入分の両方）。"""
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
@@ -240,6 +245,12 @@ class StreamerBodyService(BodyServiceBase):
                 result = await self.start_obs_recording()
                 # OBS録画開始後の安定化待機
                 await asyncio.sleep(2)
+
+            # 配信本編シーンへ自動切替（waiting → kurara_main）
+            try:
+                await obs_adapter.switch_scene(os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"))
+            except Exception as e:
+                logger.warning(f"Failed to switch to main scene: {e}")
 
             # 配信中の沈黙を埋める自動 filler ループを起動
             self._broadcasting = True
