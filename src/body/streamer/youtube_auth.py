@@ -137,3 +137,12 @@ class YouTubeAuth:
             logger.warning(f"Could not save tokens to {YOUTUBE_TOKEN_PATH}: {e}")
 
         return cls.get_service(creds), creds
+
+
+if __name__ == "__main__":
+    # 初回 OAuth 認可フロー: `python -m body.streamer.youtube_auth` で起動。
+    # data/youtube_client_secret.json を読み込み、表示された URL をブラウザで開いて
+    # 認可コードを貼り戻すと data/youtube_token.json が生成される。
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    YouTubeAuth.start_oauth_flow()
+    print(f"\nDone. Token saved to {YOUTUBE_TOKEN_PATH}")
