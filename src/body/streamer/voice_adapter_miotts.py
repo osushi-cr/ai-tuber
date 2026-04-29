@@ -94,11 +94,10 @@ _normalize_english = _normalize_text
 VOICE_DIR = Path(os.getenv("VOICE_DIR", str(Path.home() / ".cache/ai-tuber/voice")))
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
 
-# MioTTS-0.1B は学習時に長文EOSが少ないため、入力が長いと max_tokens まで暴走する。
-# 一方、短文（30字未満）は逆に間延びして話速が遅くなる傾向がある。
-# voice_adapter 側で句点分割→短文マージ→長文の読点分割→順次生成→wav結合 することで
-# 30〜100字のスイートスポットに収めて安定生成する。
-_SENTENCE_MAX_CHARS = int(os.getenv("MIOTTS_SENTENCE_MAX_CHARS", "50"))
+# MioTTS は長文を一発で投げると max_tokens まで暴走することがあるため、文単位分割で
+# サイズを揃えて安定生成する。1.7B Q4_K_M（Apache 2.0）では 100字一発まで安定（2026-04-29 ベンチ）。
+# 短文（min_chars 未満）はマージ、長文（max_chars 超）は読点で再分割。
+_SENTENCE_MAX_CHARS = int(os.getenv("MIOTTS_SENTENCE_MAX_CHARS", "100"))
 _SENTENCE_MIN_CHARS = int(os.getenv("MIOTTS_SENTENCE_MIN_CHARS", "20"))
 
 
