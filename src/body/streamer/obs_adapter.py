@@ -1,6 +1,7 @@
 """OBS WebSocket adapter for scene and source control"""
 import os
 import logging
+import unicodedata
 from typing import Optional
 import asyncio
 
@@ -34,6 +35,37 @@ EMOTION_MAP = {
 # リップシンク調整：音声が鳴り始めるまでのOBS内部遅延をミリ秒で指定
 # 0.5s〜1s遅れるとのことなので、デフォルトを400ms〜800ms程度で調整可能にします
 LIP_SYNC_ADJUST_MS = int(os.getenv("LIP_SYNC_ADJUST_MS", "500"))
+
+# ニュースキャプション用テキストソース名（kurara_main シーン内）
+NEWS_CAPTION_TITLE_SOURCE = os.getenv("NEWS_CAPTION_TITLE_SOURCE", "news_caption_title")
+NEWS_CAPTION_SUMMARY_SOURCE = os.getenv("NEWS_CAPTION_SUMMARY_SOURCE", "news_caption_summary")
+NEWS_CAPTION_SCENE = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+NEWS_CAPTION_INPUT_KIND = os.getenv("NEWS_CAPTION_INPUT_KIND", "text_ft2_source_v2")
+# 改行幅（全角=2、半角=1 として数えた桁数）。OBS GUI の表示幅に合わせて調整
+NEWS_CAPTION_TITLE_WRAP = int(os.getenv("NEWS_CAPTION_TITLE_WRAP", "30"))
+NEWS_CAPTION_SUMMARY_WRAP = int(os.getenv("NEWS_CAPTION_SUMMARY_WRAP", "36"))
+_news_caption_initialized = False
+
+
+def _wrap_jp(text: str, width: int) -> str:
+    """全角文字を2幅として扱って width 桁で折り返す。既存の改行は段落区切りとして保持する。"""
+    if width <= 0 or not text:
+        return text
+    out_lines = []
+    for paragraph in text.split("\n"):
+        line = ""
+        line_w = 0
+        for ch in paragraph:
+            ch_w = 2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
+            if line_w + ch_w > width and line:
+                out_lines.append(line)
+                line = ch
+                line_w = ch_w
+            else:
+                line += ch
+                line_w += ch_w
+        out_lines.append(line)
+    return "\n".join(out_lines)
 
 # Global WebSocket client
 ws_client: Optional[obsws] = None
@@ -513,8 +545,97 @@ async def play_media_with_emotion(audio_source: str, file_path: str, emotion: st
 
         # 8. 表情変更（口パク開始）を実行
         await set_visible_source(emotion)
-        
+
         return True
     except Exception as e:
         logger.error(f"Error in play_media_with_emotion: {e}")
         return False
+
+
+def _scene_has_source(scene_name: str, source_name: str) -> bool:
+    if not ws_client:
+        return False
+    try:
+        items = ws_client.call(obs_requests.GetSceneItemList(sceneName=scene_name)).getSceneItems()
+        return any(it.get("sourceName") == source_name for it in items)
+    except Exception as e:
+        logger.warning(f"GetSceneItemList failed for '{scene_name}': {e}")
+        return False
+
+
+def _ensure_news_caption_sources() -> bool:
+    """kurara_main シーンにキャプション用テキストソース2つを存在保証する。
+
+    既にあれば何もしない。無ければ CreateInput でデフォルト設定で作成する。
+    位置・色・フォントサイズはお兄ちゃんがOBSのGUIで微調整する前提なので
+    最小設定だけ入れて、見た目はOBS側で整える。
+    """
+    global _news_caption_initialized
+    if _news_caption_initialized:
+        return True
+    if not ws_client:
+        return False
+
+    title_default = {
+        "text": "",
+        "font": {"face": "Hiragino Sans", "size": 56, "style": "Bold", "flags": 0},
+    }
+    summary_default = {
+        "text": "",
+        "font": {"face": "Hiragino Sans", "size": 32, "style": "Regular", "flags": 0},
+    }
+
+    for src_name, settings in (
+        (NEWS_CAPTION_TITLE_SOURCE, title_default),
+        (NEWS_CAPTION_SUMMARY_SOURCE, summary_default),
+    ):
+        if _scene_has_source(NEWS_CAPTION_SCENE, src_name):
+            continue
+        try:
+            ws_client.call(obs_requests.CreateInput(
+                sceneName=NEWS_CAPTION_SCENE,
+                inputName=src_name,
+                inputKind=NEWS_CAPTION_INPUT_KIND,
+                inputSettings=settings,
+                sceneItemEnabled=True,
+            ))
+            logger.info(f"Created news caption source '{src_name}' in scene '{NEWS_CAPTION_SCENE}'")
+        except Exception as e:
+            logger.warning(f"CreateInput '{src_name}' failed (may already exist as another kind): {e}")
+
+    _news_caption_initialized = True
+    return True
+
+
+async def update_news_caption(title: str, summary: str) -> bool:
+    """ニュースキャプションのテキストを更新する。
+
+    title が現在読み上げ中の記事タイトル、summary が3行要約の本文。
+    ソースが存在しなければ初回呼び出しで自動作成する。
+    """
+    if not await connect():
+        return False
+    try:
+        _ensure_news_caption_sources()
+        wrapped_title = _wrap_jp(title or "", NEWS_CAPTION_TITLE_WRAP)
+        wrapped_summary = _wrap_jp(summary or "", NEWS_CAPTION_SUMMARY_WRAP)
+        ws_client.call(obs_requests.SetInputSettings(
+            inputName=NEWS_CAPTION_TITLE_SOURCE,
+            inputSettings={"text": wrapped_title},
+            overlay=True,
+        ))
+        ws_client.call(obs_requests.SetInputSettings(
+            inputName=NEWS_CAPTION_SUMMARY_SOURCE,
+            inputSettings={"text": wrapped_summary},
+            overlay=True,
+        ))
+        logger.info(f"News caption updated: title='{title[:30]}...'")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update news caption: {e}")
+        return False
+
+
+async def clear_news_caption() -> bool:
+    """ニュースキャプションを空にする（NEWSフェーズ終了時など）。"""
+    return await update_news_caption("", "")

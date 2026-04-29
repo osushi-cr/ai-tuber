@@ -174,6 +174,27 @@ class BodyApp:
             logger.error(f"Error in scene/switch API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def caption_news_api(self, request: Request) -> JSONResponse:
+        """OBS のニュースキャプション（タイトル＋要約）を更新する。"""
+        try:
+            body = await request.json()
+            title = body.get("title", "")
+            summary = body.get("summary", "")
+            result = await self.service.update_news_caption(title, summary)
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in caption/news API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    async def caption_clear_api(self, request: Request) -> JSONResponse:
+        """OBS のニュースキャプションを空にする。"""
+        try:
+            result = await self.service.clear_news_caption()
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in caption/clear API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     def get_routes(self) -> list[Route]:
         """共通のルート定義を返します。"""
         return [
@@ -191,4 +212,6 @@ class BodyApp:
             Route("/api/filler/play", self.filler_play_api, methods=["POST"]),
             Route("/api/chitchat/register", self.chitchat_register_api, methods=["POST"]),
             Route("/api/scene/switch", self.scene_switch_api, methods=["POST"]),
+            Route("/api/caption/news", self.caption_news_api, methods=["POST"]),
+            Route("/api/caption/clear", self.caption_clear_api, methods=["POST"]),
         ]

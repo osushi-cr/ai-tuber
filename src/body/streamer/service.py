@@ -204,6 +204,16 @@ class StreamerBodyService(BodyServiceBase):
         ok = await obs_adapter.switch_scene(scene_name)
         return f"Scene switched to '{scene_name}'" if ok else f"Failed to switch scene to '{scene_name}'"
 
+    async def update_news_caption(self, title: str, summary: str) -> str:
+        """OBS のニュースキャプション（タイトル＋要約）を更新する。"""
+        ok = await obs_adapter.update_news_caption(title, summary)
+        return "News caption updated" if ok else "Failed to update news caption"
+
+    async def clear_news_caption(self) -> str:
+        """OBS のニュースキャプションを空にする。"""
+        ok = await obs_adapter.clear_news_caption()
+        return "News caption cleared" if ok else "Failed to clear news caption"
+
     async def get_comments(self) -> str:
         """コメントを取得します（YouTube live chat ＋ ダミー注入分の両方）。"""
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"

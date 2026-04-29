@@ -112,6 +112,10 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
         item = ctx.news_service.peek_current_item()
         if item:
             logger.info(f"Reading news item: {item.title}")
+            try:
+                await ctx.saint_graph.body.update_news_caption(item.title, item.content)
+            except Exception as e:
+                logger.warning(f"Failed to update news caption: {e}")
             await ctx.saint_graph.process_news_reading(title=item.title, content=item.content)
             # 成功したのでインデックスを進める
             ctx.news_service.get_next_item()
@@ -126,6 +130,10 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
 
     # ニュース全消化 → QA（コメント拾いコーナー）へ
     logger.info("All news items read. Moving to QA (comment corner).")
+    try:
+        await ctx.saint_graph.body.clear_news_caption()
+    except Exception as e:
+        logger.warning(f"Failed to clear news caption: {e}")
     await ctx.saint_graph.process_news_finished()
     return BroadcastPhase.QA
 

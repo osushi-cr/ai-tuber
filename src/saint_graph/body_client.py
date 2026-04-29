@@ -159,6 +159,20 @@ class BodyClient:
             return data.get("result", f"Scene switched to {scene_name}")
         return f"Error: Failed to switch scene to {scene_name}"
 
+    async def update_news_caption(self, title: str, summary: str) -> str:
+        """OBS のニュースキャプション（タイトル＋要約）を更新する。"""
+        data = await self._request("POST", "/api/caption/news", {"title": title, "summary": summary})
+        if data:
+            return data.get("result", "News caption updated")
+        return "Error: Failed to update news caption"
+
+    async def clear_news_caption(self) -> str:
+        """OBS のニュースキャプションを空にする。"""
+        data = await self._request("POST", "/api/caption/clear", {})
+        if data:
+            return data.get("result", "News caption cleared")
+        return "Error: Failed to clear news caption"
+
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""
         url = f"{self.base_url}/health"
