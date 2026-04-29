@@ -278,9 +278,27 @@ _STYLE_PARAMS: dict[str, dict] = {
         "top_p": _DEFAULT_TOP_P,
         "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
     },
-    "joyful": {
+    "sad": {
+        "preset_id": MIOTTS_PRESET_ID,
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+    },
+    "fun": {
         "preset_id": "kurara_joyful",
-        "temperature": 1.2,
+        "temperature": 0.9,
+        "top_p": _DEFAULT_TOP_P,
+        "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
+    },
+    "joyful": {
+        "preset_id": MIOTTS_PRESET_ID,
+        "temperature": 1.0,
+        "top_p": _DEFAULT_TOP_P,
+        "repetition_penalty": 1.2,
+    },
+    "angry": {
+        "preset_id": "kurara_joyful",
+        "temperature": 1.0,
         "top_p": _DEFAULT_TOP_P,
         "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
     },
