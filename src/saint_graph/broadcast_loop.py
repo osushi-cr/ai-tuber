@@ -30,6 +30,8 @@ class BroadcastContext:
     saint_graph: SaintGraph
     news_service: NewsService
     idle_counter: int = 0
+    # 次ニュースのプリフェッチ task（speak キュー投入まで完了させて保持）
+    next_news_task: Optional[asyncio.Task] = None
 
 
 # ---------------------------------------------------------------------------
@@ -68,29 +70,23 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
 async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。
 
-    intro→news1 間の沈黙を最小化するため、intro セリフ生成と並行して
-    news1 セリフを先取り生成する。Gemini 単一セッションで並行呼び出しが
-    解決できる場合は完全並行、そうでなければ直列だが voice キューに 2 個
-    積まれて auto-filler が間を埋めるので体感差はあまり出ない。
+    intro→news1 間の沈黙を最小化するため、intro セリフ生成・再生と並行して
+    news1 のセリフ生成（speak キュー投入まで）を先取りする。
+    生成済 task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
     """
     intro_task = asyncio.create_task(ctx.saint_graph.process_intro())
 
-    news1_task = None
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
         if first_item:
             logger.info(f"Prefetching news1: {first_item.title}")
-            news1_task = asyncio.create_task(
+            ctx.next_news_task = asyncio.create_task(
                 ctx.saint_graph.process_news_reading(
-                    title=first_item.title, content=first_item.content
+                    title=first_item.title, content=first_item.content, wait_after=False
                 )
             )
-            # peek 分のインデックスを進めて handle_news が news[1] から始まるようにする
-            ctx.news_service.get_next_item()
 
     await intro_task
-    if news1_task is not None:
-        await news1_task
 
     return BroadcastPhase.NEWS
 
@@ -98,8 +94,12 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     """
     NEWS: コメント優先で確認し、なければニュースを 1 本読み上げる。
-    ニュース読み終わり毎に aizuchi 系のフィラーを 1 個キューに積み、
-    次のニュースのセリフ生成中の沈黙を埋める。
+
+    プリフェッチ最適化:
+    - 現ニュースの音声合成は ctx.next_news_task に既に積まれているはず（無ければ即時生成）
+    - 現ニュース再生開始と同時に「次のニュース」のセリフ生成 task をキック
+    - 再生完了を wait_for_queue で待機 → 次ループへ
+
     ニュースを全消化したら QA へ遷移する。
     """
     # コメント優先
@@ -107,36 +107,61 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
         ctx.idle_counter = 0
         return BroadcastPhase.NEWS
 
-    # 次のニュースを読み上げ
-    if ctx.news_service.has_next():
-        # peek して使う（成功した場合にのみ進める）
-        item = ctx.news_service.peek_current_item()
-        if item:
-            logger.info(f"Reading news item: {item.title}")
-            try:
-                await ctx.saint_graph.body.update_news_caption(item.title, item.content)
-            except Exception as e:
-                logger.warning(f"Failed to update news caption: {e}")
-            await ctx.saint_graph.process_news_reading(title=item.title, content=item.content)
-            # 成功したのでインデックスを進める
-            ctx.news_service.get_next_item()
-            # ニュース完了→次のセリフ生成中（Gemini応答待ち）の沈黙を埋めるため、
-            # aizuchi 系の filler を 1 個キューに積む。voice キューに積まれるので
-            # 次の発話が始まるまでに自然に再生される。
-            try:
-                await ctx.saint_graph.body.play_filler("aizuchi")
-            except Exception as e:
-                logger.warning(f"Failed to queue filler between news items: {e}")
-            return BroadcastPhase.NEWS
-
     # ニュース全消化 → QA（コメント拾いコーナー）へ
-    logger.info("All news items read. Moving to QA (comment corner).")
+    if not ctx.news_service.has_next():
+        logger.info("All news items read. Moving to QA (comment corner).")
+        try:
+            await ctx.saint_graph.body.clear_news_caption()
+        except Exception as e:
+            logger.warning(f"Failed to clear news caption: {e}")
+        await ctx.saint_graph.process_news_finished()
+        return BroadcastPhase.QA
+
+    item = ctx.news_service.peek_current_item()
+    if not item:
+        return BroadcastPhase.QA
+
+    logger.info(f"Reading news item: {item.title}")
     try:
-        await ctx.saint_graph.body.clear_news_caption()
+        await ctx.saint_graph.body.update_news_caption(item.title, item.content)
     except Exception as e:
-        logger.warning(f"Failed to clear news caption: {e}")
-    await ctx.saint_graph.process_news_finished()
-    return BroadcastPhase.QA
+        logger.warning(f"Failed to update news caption: {e}")
+
+    # 現ニュース: prefetch 済 task があれば await（既にキュー投入済 or 投入直前）、無ければ即時生成
+    if ctx.next_news_task is not None:
+        try:
+            await ctx.next_news_task
+        except Exception as e:
+            logger.warning(f"Prefetched news task failed, falling back to inline generation: {e}")
+            await ctx.saint_graph.process_news_reading(title=item.title, content=item.content, wait_after=False)
+        ctx.next_news_task = None
+    else:
+        await ctx.saint_graph.process_news_reading(title=item.title, content=item.content, wait_after=False)
+
+    # 現ニュースの index を進める
+    ctx.news_service.get_next_item()
+
+    # 次ニュースの prefetch を仕込む（現ニュース再生中に並行してセリフ生成）
+    if ctx.news_service.has_next():
+        next_item = ctx.news_service.peek_current_item()
+        if next_item:
+            logger.info(f"Prefetching next news: {next_item.title}")
+            ctx.next_news_task = asyncio.create_task(
+                ctx.saint_graph.process_news_reading(
+                    title=next_item.title, content=next_item.content, wait_after=False
+                )
+            )
+
+    # 現ニュースの音声再生完了を待つ（auto-filler 起動条件にも影響するので必須）
+    await ctx.saint_graph.body.wait_for_queue()
+
+    # ニュース完了 → aizuchi 系 filler を 1 個積んで次のセリフ生成中の沈黙を埋める
+    try:
+        await ctx.saint_graph.body.play_filler("aizuchi")
+    except Exception as e:
+        logger.warning(f"Failed to queue filler between news items: {e}")
+
+    return BroadcastPhase.NEWS
 
 
 # QA で促進セリフを発する間隔（poll サイクル数）。1cycle = POLL_INTERVAL 秒。

@@ -79,11 +79,15 @@ class SaintGraph:
         template = self.templates.get("intro", "こんにちは。配信を始めます。")
         await self.process_turn(template, context="Intro")
 
-    async def process_news_reading(self, title: str, content: str):
-        """ニュース読み上げを実行します。"""
+    async def process_news_reading(self, title: str, content: str, wait_after: bool = True):
+        """ニュース読み上げを実行します。
+
+        wait_after=False のとき、Gemini 応答→speak キュー投入まで完了したら return し、
+        音声再生完了は待たない。連続ニュースのプリフェッチで使う。
+        """
         template = self.templates.get("news_reading", "ニュース「{title}」を読み上げます。\n{content}")
         instruction = template.format(title=title, content=content)
-        await self.process_turn(instruction, context=f"News Reading: {title}")
+        await self.process_turn(instruction, context=f"News Reading: {title}", wait_after=wait_after)
 
     async def process_news_finished(self):
         """ニュース全消化時の反応を実行します。"""
@@ -133,10 +137,13 @@ class SaintGraph:
 
     # --- メインターン処理 ---
 
-    async def process_turn(self, user_input: str, context: Optional[str] = None):
+    async def process_turn(self, user_input: str, context: Optional[str] = None, wait_after: bool = True):
         """
         単一のインタラクションターンを処理します。
         AIからのテキスト出力を取得し、随時パースして文章単位でストリーミング的に Body API (TTS) を実行します。
+
+        wait_after=False のとき、speak キュー投入まで完了したら return し、再生完了は待たない。
+        プリフェッチ用（呼び出し側で wait_for_queue するなど別途同期する）。
         """
         logger.info(f"Turn started. Input: {user_input[:50]}..., Context: {context}")
         max_retries = 3
@@ -190,14 +197,18 @@ class SaintGraph:
                     sentences_spoken += count
 
                 if sentences_spoken > 0:
-                    # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
-                    logger.info("Waiting for speech to finish before completing turn...")
-                    await self.body.wait_for_queue()
-                    
-                    # 話し終わったら「無言」状態に切り替える
-                    await self.body.change_emotion("silent")
-                    
-                    logger.info(f"Turn completed. {sentences_spoken} sentences spoken")
+                    if wait_after:
+                        # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
+                        logger.info("Waiting for speech to finish before completing turn...")
+                        await self.body.wait_for_queue()
+
+                        # 話し終わったら「無言」状態に切り替える
+                        await self.body.change_emotion("silent")
+
+                        logger.info(f"Turn completed. {sentences_spoken} sentences spoken")
+                    else:
+                        # プリフェッチモード: speak キュー投入まで完了。再生完了は呼び出し側で同期する。
+                        logger.info(f"Turn queued (prefetch). {sentences_spoken} sentences in queue")
                 else:
                     logger.warning("No text output received from AI.")
                 
