@@ -6,9 +6,10 @@ BroadcastPhase (Enum) と各フェーズのハンドラで構成されます。
 """
 import asyncio
 import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from .config import logger, POLL_INTERVAL, MAX_WAIT_CYCLES
 from .saint_graph import SaintGraph
@@ -38,6 +39,53 @@ class BroadcastContext:
 # 共通ユーティリティ
 # ---------------------------------------------------------------------------
 
+# 「w」「ｗ」「草」や記号のみのノイズ系コメントを判定するパターン
+_COMMENT_NOISE_PATTERN = re.compile(r"^[wｗ草!！?？\s\.,。、ー]+$")
+_COMMENT_MIN_LEN = 3
+_COMMENT_PICK_MAX = int(os.getenv("COMMENT_PICK_MAX", "3"))
+
+
+def _filter_meaningful_comments(
+    comments_data: List[Dict[str, Any]], max_count: int = _COMMENT_PICK_MAX
+) -> List[Dict[str, Any]]:
+    """くらら反応用に「有意義なコメント」を最大 max_count 件まで選別する。
+
+    ルール:
+    - 文字数 _COMMENT_MIN_LEN 未満は除外
+    - "wwww" / "草" / "！？" のみのノイズ系は除外
+    - 同じ author の連投は最新1件のみ残す
+    - ? / ？ を含む質問系を優先し、それ以外を後ろにつける
+    """
+    if not comments_data:
+        return []
+
+    # 1. ノイズ・極短コメント除外
+    filtered: List[Dict[str, Any]] = []
+    for c in comments_data:
+        msg = (c.get("message") or "").strip()
+        if len(msg) < _COMMENT_MIN_LEN:
+            continue
+        if _COMMENT_NOISE_PATTERN.match(msg):
+            continue
+        filtered.append(c)
+
+    # 2. 同 author は最新（後勝ち）の1件にまとめる
+    by_author: Dict[str, Dict[str, Any]] = {}
+    for c in filtered:
+        author = c.get("author") or "User"
+        by_author[author] = c
+    deduped = list(by_author.values())
+
+    # 3. 質問系を先頭に、その他を後ろに
+    questions = [
+        c for c in deduped
+        if "?" in (c.get("message") or "") or "？" in (c.get("message") or "")
+    ]
+    others = [c for c in deduped if c not in questions]
+
+    return (questions + others)[:max_count]
+
+
 async def _poll_and_respond(ctx: BroadcastContext) -> bool:
     """
     コメントをポーリングし、あれば応答します。
@@ -47,17 +95,24 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
     """
     try:
         comments_data = await ctx.saint_graph.body.get_comments()
-        logger.info(f"[debug:_poll_and_respond] type={type(comments_data).__name__} len={len(comments_data) if hasattr(comments_data, '__len__') else 'N/A'} value={comments_data!r}")
 
-        if comments_data:
-            comments_text = "\n".join(
-                f"{c.get('author', 'User')}: {c.get('message', '')}"
-                for c in comments_data
-            )
-            if comments_text:
-                logger.info(f"Comments received: {comments_text}")
-                await ctx.saint_graph.process_turn(comments_text)
-                return True
+        if not comments_data:
+            return False
+
+        picked = _filter_meaningful_comments(comments_data)
+        if not picked:
+            logger.info(f"[poll] {len(comments_data)} comments retrieved but all filtered as noise/short")
+            return False
+
+        comments_text = "\n".join(
+            f"{c.get('author', 'User')}: {c.get('message', '')}"
+            for c in picked
+        )
+        logger.info(
+            f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
+        )
+        await ctx.saint_graph.process_turn(comments_text)
+        return True
     except Exception as e:
         logger.error(f"Error in polling/turn: {e}", exc_info=True)
     return False
