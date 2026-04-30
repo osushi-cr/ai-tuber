@@ -43,7 +43,6 @@ class StreamerBodyService(BodyServiceBase):
         self._current_broadcast_id = None
         self._action_queue = asyncio.Queue()
         self._worker_task = None
-        self._pending_broadcast_config = None
         # Test/local injected comments (drained on each get_comments call).
         # In production this is empty and YouTube live chat fills the response.
         self._dummy_comments: list[dict] = []
@@ -54,6 +53,8 @@ class StreamerBodyService(BodyServiceBase):
         self._auto_filler_task = None
         # idle 中に saint_graph から事前登録された雑談セリフを混ぜる用
         self._chitchat_pool: list[str] = []
+        # 初回 speak で waiting → kurara_main へ切替＋auto-filler 起動するため
+        self._first_speech_done = False
 
     async def inject_comment(self, author: str, message: str) -> str:
         """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
@@ -95,16 +96,22 @@ class StreamerBodyService(BodyServiceBase):
                     text = task.get("text")
                     style = task.get("style")
                     speaker_id = task.get("speaker_id")
-                    
+
                     try:
                         # 1. 音声生成（2〜3秒かかる）
                         file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
-                        
-                        # 2. 【配信開始の同期（初回のみ）】
-                        if self._pending_broadcast_config is not None:
-                            config = self._pending_broadcast_config
-                            self._pending_broadcast_config = None
-                            await self._execute_actual_broadcast_start(config)
+
+                        # 2. 【初回 speak 時に waiting → kurara_main 切替 ＋ auto-filler 起動】
+                        if self._broadcasting and not self._first_speech_done:
+                            self._first_speech_done = True
+                            try:
+                                await obs_adapter.switch_scene(os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"))
+                            except Exception as e:
+                                logger.warning(f"Failed to switch to main scene on first speech: {e}")
+                            self._last_audio_end_time = time.time()
+                            if self._auto_filler_task is None or self._auto_filler_task.done():
+                                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
+                                logger.info("Auto-filler loop started on first speech")
 
                         # 3. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
                         await self.play_audio_with_sync_emotion(file_path, duration, style)
@@ -262,14 +269,19 @@ class StreamerBodyService(BodyServiceBase):
         return json.dumps(comments, ensure_ascii=False)
 
     async def start_broadcast(self, config: Optional[Dict[str, Any]] = None) -> str:
-        """配信または録画の開始を予約します（最初の発話時に同期して開始されます）。"""
-        self._pending_broadcast_config = config or {}
-        logger.info("[start_broadcast] Broadcast start deferred until first speech.")
-        return "配信開始を予約しました。最初の発話に合わせて開始されます。"
+        """配信または録画を即時開始します。
 
-    async def _execute_actual_broadcast_start(self, config: Dict[str, Any]) -> str:
-        """実際に配信または録画を開始する内部メソッド。"""
+        OBS は呼び出し時のシーン（通常 waiting）のまま視聴者へ配信される。
+        最初の speak が来た時点で kurara_main シーンへ自動切替し auto-filler が起動する。
+        """
+        config = config or {}
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
+
+        # 前回配信時のニュースキャプションが残らないよう、配信開始時に必ず初期化する。
+        try:
+            await obs_adapter.clear_news_caption()
+        except Exception as e:
+            logger.warning(f"Failed to clear news caption at broadcast start: {e}")
 
         try:
             if streaming_mode:
@@ -281,21 +293,12 @@ class StreamerBodyService(BodyServiceBase):
                 # OBS録画開始後の安定化待機
                 await asyncio.sleep(2)
 
-            # 配信本編シーンへ自動切替（waiting → kurara_main）
-            try:
-                await obs_adapter.switch_scene(os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"))
-            except Exception as e:
-                logger.warning(f"Failed to switch to main scene: {e}")
-
-            # 配信中の沈黙を埋める自動 filler ループを起動
             self._broadcasting = True
-            self._last_audio_end_time = time.time()
-            if self._auto_filler_task is None or self._auto_filler_task.done():
-                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
-                logger.info("Auto-filler loop started")
+            self._first_speech_done = False
+            logger.info("[start_broadcast] Broadcast started. Streaming the current scene (typically 'waiting').")
             return result
         except Exception as e:
-            logger.error(f"Error in _execute_actual_broadcast_start: {e}")
+            logger.error(f"Error in start_broadcast: {e}")
             return f"配信開始エラー: {str(e)}"
 
     async def _auto_filler_loop(self):
