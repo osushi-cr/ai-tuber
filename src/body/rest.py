@@ -44,13 +44,24 @@ class BodyApp:
             logger.error(f"Error in change_emotion API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
-    async def get_comments_api(self, request: Request) -> JSONResponse:
+    async def peek_comments_api(self, request: Request) -> JSONResponse:
+        """OBS overlay 表示用: コメントを buffer から peek（破壊しない）。"""
         try:
-            result = await self.service.get_comments()
+            result = await self.service.peek_comments()
             comments = json.loads(result) if result else []
             return JSONResponse({"status": "ok", "comments": comments})
         except Exception as e:
-            logger.error(f"Error in get_comments API: {e}")
+            logger.error(f"Error in peek_comments API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    async def consume_comments_api(self, request: Request) -> JSONResponse:
+        """saint_graph リアクション用: コメントを buffer から consume（drain）。"""
+        try:
+            result = await self.service.consume_comments()
+            comments = json.loads(result) if result else []
+            return JSONResponse({"status": "ok", "comments": comments})
+        except Exception as e:
+            logger.error(f"Error in consume_comments API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
     async def inject_comment_api(self, request: Request) -> JSONResponse:
@@ -201,7 +212,8 @@ class BodyApp:
             Route("/health", self.health_check, methods=["GET"]),
             Route("/api/speak", self.speak_api, methods=["POST"]),
             Route("/api/change_emotion", self.change_emotion_api, methods=["POST"]),
-            Route("/api/comments", self.get_comments_api, methods=["GET"]),
+            Route("/api/comments", self.peek_comments_api, methods=["GET"]),
+            Route("/api/comments/consume", self.consume_comments_api, methods=["POST"]),
             Route("/api/comments/inject", self.inject_comment_api, methods=["POST"]),
             Route("/api/broadcast/start", self.start_broadcast_api, methods=["POST"]),
             Route("/api/broadcast/stop", self.stop_broadcast_api, methods=["POST"]),

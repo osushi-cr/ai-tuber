@@ -45,6 +45,7 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
     """
     try:
         comments_data = await ctx.saint_graph.body.get_comments()
+        logger.info(f"[debug:_poll_and_respond] type={type(comments_data).__name__} len={len(comments_data) if hasattr(comments_data, '__len__') else 'N/A'} value={comments_data!r}")
 
         if comments_data:
             comments_text = "\n".join(
@@ -56,7 +57,7 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
                 await ctx.saint_graph.process_turn(comments_text)
                 return True
     except Exception as e:
-        logger.error(f"Error in polling/turn: {e}")
+        logger.error(f"Error in polling/turn: {e}", exc_info=True)
     return False
 
 

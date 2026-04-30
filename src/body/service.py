@@ -20,8 +20,13 @@ class BodyServiceBase(ABC):
         ...
 
     @abstractmethod
-    async def get_comments(self) -> str:
-        """コメントを取得します。JSON 文字列（List[Dict]）を返します。"""
+    async def peek_comments(self) -> str:
+        """OBS overlay 表示用にコメントを peek します（破壊しない）。JSON 文字列（List[Dict]）を返します。"""
+        ...
+
+    @abstractmethod
+    async def consume_comments(self) -> str:
+        """saint_graph リアクション用にコメントを consume します（buffer drain）。JSON 文字列（List[Dict]）を返します。"""
         ...
 
     @abstractmethod

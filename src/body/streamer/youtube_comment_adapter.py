@@ -6,13 +6,24 @@ import queue
 import os
 import json
 import logging
-from typing import List, Dict, Optional
+from collections import deque
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 
+# OBS overlay と saint_graph が同じバッファを peek/consume するので、
+# バッファに残るコメント数の上限。古いものから FIFO 削除。
+BUFFER_MAX = 100
+
 
 class YouTubeCommentAdapter:
-    """Adapter for fetching YouTube Live comments using subprocess"""
+    """Adapter for fetching YouTube Live comments using subprocess.
+
+    OBS overlay 表示用の peek（非破壊）と saint_graph リアクション用の
+    consume（破壊）を別メソッドに分離する。subprocess の stdout から
+    取り込んだコメントは内部 buffer に溜め、peek は buffer のコピーを、
+    consume は buffer 全件返してクリアする。
+    """
 
     def __init__(self, video_id: str):
         """
@@ -34,17 +45,21 @@ class YouTubeCommentAdapter:
         )
         self.q: queue.Queue = queue.Queue()
         self.error_q: queue.Queue = queue.Queue()
-        
+
         # stdout監視スレッド（コメント取得用）
         self.thread = threading.Thread(target=self.enqueue_output, args=(self.process.stdout, self.q))
         self.thread.daemon = True
         self.thread.start()
-        
+
         # stderr監視スレッド（エラー検出用）
         self.error_thread = threading.Thread(target=self.enqueue_output, args=(self.process.stderr, self.error_q))
         self.error_thread.daemon = True
         self.error_thread.start()
-        
+
+        # peek/consume の双方が参照する内部 buffer（直近 BUFFER_MAX 件まで FIFO）
+        self._buffer: deque = deque(maxlen=BUFFER_MAX)
+        self._buffer_lock = threading.Lock()
+
         logger.info(f"Started YouTube comment adapter for video: {video_id}")
 
     def enqueue_output(self, out, queue: queue.Queue):
@@ -53,21 +68,14 @@ class YouTubeCommentAdapter:
             queue.put(line)
         out.close()
 
-    def get(self) -> List[Dict]:
-        """
-        サブプロセスからデータを取得してリストで返す
-        
-        Returns:
-            List of comment dictionaries
-        """
-        new_comments = []
-        
+    def _drain_subprocess(self) -> None:
+        """subprocess の stdout/stderr queue を取り込み、buffer に追加する。"""
         # エラー出力をチェック
         while not self.error_q.empty():
             line = self.error_q.get_nowait()
             if not line:
                 continue
-            
+
             line = line.strip()
             if line.startswith("DEBUG: "):
                 logger.debug(f"YouTube comment subprocess: {line[7:]}")
@@ -81,8 +89,8 @@ class YouTubeCommentAdapter:
                 # プレフィックスがない場合でも、予期せぬエラーの可能性を考慮して警告する
                 logger.warning(f"YouTube comment subprocess (unprefixed): {line}")
 
-        
-        # コメントを取得
+        # コメントを取得して buffer に追加
+        new_comments: list[dict] = []
         while not self.q.empty():
             line = self.q.get_nowait()
             if line:
@@ -94,7 +102,23 @@ class YouTubeCommentAdapter:
                         new_comments.append(comment_data)
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse comment JSON: {e}, line: {line.strip()}")
-        return new_comments
+        if new_comments:
+            with self._buffer_lock:
+                self._buffer.extend(new_comments)
+
+    def peek(self) -> List[Dict]:
+        """OBS overlay 表示用: buffer のスナップショットを返す（破壊しない）。"""
+        self._drain_subprocess()
+        with self._buffer_lock:
+            return list(self._buffer)
+
+    def consume(self) -> List[Dict]:
+        """saint_graph リアクション用: buffer 全件返して buffer をクリア。"""
+        self._drain_subprocess()
+        with self._buffer_lock:
+            comments = list(self._buffer)
+            self._buffer.clear()
+            return comments
 
     def close(self):
         """サブプロセスを終了させる"""

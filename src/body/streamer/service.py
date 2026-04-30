@@ -214,18 +214,43 @@ class StreamerBodyService(BodyServiceBase):
         ok = await obs_adapter.clear_news_caption()
         return "News caption cleared" if ok else "Failed to clear news caption"
 
-    async def get_comments(self) -> str:
-        """コメントを取得します（YouTube live chat ＋ ダミー注入分の両方）。"""
+    async def peek_comments(self) -> str:
+        """OBS overlay 表示用にコメントを peek する（buffer を破壊しない）。
+
+        YouTube live chat 由来は adapter の buffer をスナップショット、
+        ダミー注入分はそのまま返す（こちらも破壊しない）。
+        """
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
 
         comments: list[dict] = []
         try:
             if streaming_mode and self._youtube_comment_adapter:
-                comments.extend(self._youtube_comment_adapter.get() or [])
+                comments.extend(self._youtube_comment_adapter.peek() or [])
         except Exception as e:
-            logger.error(f"Error fetching YouTube comments: {e}")
+            logger.error(f"Error fetching YouTube comments (peek): {e}")
 
-        # Drain dummy comments (test/local).
+        if self._dummy_comments:
+            comments.extend(self._dummy_comments)
+
+        if not comments:
+            return json.dumps([])
+
+        return json.dumps(comments, ensure_ascii=False)
+
+    async def consume_comments(self) -> str:
+        """saint_graph リアクション用にコメントを consume する（buffer を drain）。
+
+        YouTube live chat 由来とダミー注入分の両方を drain して返す。
+        """
+        streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
+
+        comments: list[dict] = []
+        try:
+            if streaming_mode and self._youtube_comment_adapter:
+                comments.extend(self._youtube_comment_adapter.consume() or [])
+        except Exception as e:
+            logger.error(f"Error fetching YouTube comments (consume): {e}")
+
         if self._dummy_comments:
             comments.extend(self._dummy_comments)
             self._dummy_comments = []
@@ -233,7 +258,7 @@ class StreamerBodyService(BodyServiceBase):
         if not comments:
             return json.dumps([])
 
-        logger.info(f"[get_comments] Retrieved {len(comments)} comments")
+        logger.info(f"[consume_comments] Drained {len(comments)} comments")
         return json.dumps(comments, ensure_ascii=False)
 
     async def start_broadcast(self, config: Optional[Dict[str, Any]] = None) -> str:

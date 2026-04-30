@@ -86,8 +86,8 @@ class BodyClient:
         return f"Error: Failed to change emotion to {emotion}"
     
     async def get_comments(self) -> List[Dict[str, Any]]:
-        """直近のユーザーコメントを取得します。"""
-        data = await self._request("GET", "/api/comments")
+        """直近のユーザーコメントを consume（取得＋buffer drain）します。"""
+        data = await self._request("POST", "/api/comments/consume", {})
         if data:
             return data.get("comments", [])
         return []

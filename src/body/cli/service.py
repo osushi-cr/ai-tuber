@@ -20,13 +20,18 @@ class CLIBodyService(BodyServiceBase):
         """アバターの感情を変更します。"""
         return f"Emotion changed to {emotion}"
 
-    async def get_comments(self) -> str:
-        """キューに蓄積されたユーザーコメントを取得します。"""
+    async def peek_comments(self) -> str:
+        """CLI モードでは入力読み取りが破壊操作なので、peek は空配列を返す（OBS overlay 不使用）。"""
+        import json
+        return json.dumps([])
+
+    async def consume_comments(self) -> str:
+        """キューに蓄積されたユーザーコメントを取得します（破壊）。"""
         import json
         inputs = io_adapter.get_inputs()
         if not inputs:
             return json.dumps([])
-        
+
         # body-streamerの形式に合わせて、辞書のリストとして返す
         comments = [{"author": "User", "message": line} for line in inputs]
         return json.dumps(comments, ensure_ascii=False)
