@@ -89,7 +89,7 @@ combined_prompt = f"{system_prompt}\n\n{character_prompt}"
 ### 主要機能:
 - Agent の初期化と MCP ツールセット統合
 - `process_turn()`: ターン処理と感情パース
-- **高レベルメソッド**: `process_intro()`, `process_news_reading()`, `process_news_finished()`, `process_closing()` による配信アクションの抽象化
+- **高レベルメソッド**: `process_intro()`, `process_news_reading()`, `prepare_news_reading_text()`, `play_prepared_sentences()`, `process_news_finished()`, `process_closing()` による配信アクションの抽象化
 - セッション管理
 ドは、`Runner` を介して AI とのやり取りを1ターン処理します。
 
@@ -105,9 +105,9 @@ combined_prompt = f"{system_prompt}\n\n{character_prompt}"
 ### フェーズ遷移
 
 ```
-INTRO → NEWS → (NEWS を繰り返し) → IDLE → (待機) → CLOSING → 終了
-            ↑                         ↑
-            コメント応答で留まる        コメント応答でカウンタリセット
+INTRO → NEWS → (NEWS を繰り返し) → QA → (コメント待機) → CLOSING → 終了
+            ↑                       ↑
+            コメント応答で留まる      コメント応答でカウンタリセット
 ```
 
 ### コメント処理の共通化
@@ -128,8 +128,8 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
 ```python
 _HANDLERS = {
     BroadcastPhase.INTRO:   handle_intro,    # オープニングトーク。終了後、NEWS フェーズへ移行
-    BroadcastPhase.NEWS:    handle_news,     # ニュース読み上げ。記事が残っていれば継続、なければ IDLE へ
-    BroadcastPhase.IDLE:    handle_idle,     # 雑談・コメント待機。一定時間経過で CLOSING へ
+    BroadcastPhase.NEWS:    handle_news,     # ニュース読み上げ。記事が残っていれば継続、なければ QA へ
+    BroadcastPhase.QA:      handle_qa,       # コメント待機。一定時間経過で CLOSING へ
     BroadcastPhase.CLOSING: handle_closing,  # クロージングトーク。終了後、配信ループを停止
 }
 ```
@@ -259,6 +259,13 @@ session = agent.start_session()
 ### 非同期キューと待機の「いいとこ取り」構成
 
 文法的な滑らかさと、対話のリズム（コメントを拾うタイミング）を両立するため、非同期キューと一括待機を組み合わせた構成を採用しています。
+
+ニュース読み上げでは、次ニュースの先読みを **生成フェーズ** と **再生フェーズ** に分けています。
+
+- `prepare_news_reading_text()`: Gemini で `(感情, 文)` のリストだけを生成し、Body の発話キューには投入しません。
+- `play_prepared_sentences()`: 生成済みの文を現在ニュースとして Body の発話キューに投入します。
+
+これにより、現ニュースの再生中に次ニュースの Gemini 生成だけを並行化しつつ、`wait_for_queue()` は現ニュース分の発話完了だけを待ちます。未来ニュースの `speak` が先にキューへ積まれないため、OBS caption と読み上げ内容の対応が崩れません。
 
 ```python
 for sentence in sentences:

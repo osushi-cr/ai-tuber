@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import traceback
-from typing import List, Optional, Any, Iterable
+from typing import List, Optional, Any, Iterable, Tuple
 
 from google.adk import Agent
 from google.adk.runners import InMemoryRunner
@@ -79,6 +79,16 @@ class SaintGraph:
         template = self.templates.get("intro", "こんにちは。配信を始めます。")
         await self.process_turn(template, context="Intro")
 
+    async def prepare_news_reading_text(self, title: str, content: str) -> List[Tuple[str, str]]:
+        """ニュース読み上げ用のセリフだけを生成し、発話キューには投入しません。"""
+        template = self.templates.get("news_reading", "ニュース「{title}」を読み上げます。\n{content}")
+        instruction = template.format(title=title, content=content)
+        return await self._collect_turn_sentences(instruction, context=f"News Reading: {title}")
+
+    async def play_prepared_sentences(self, sentences: List[Tuple[str, str]], wait_after: bool = True):
+        """生成済みセリフを Body の発話キューへ投入します。"""
+        await self._play_sentences(sentences, wait_after=wait_after)
+
     async def process_news_reading(self, title: str, content: str, wait_after: bool = True):
         """ニュース読み上げを実行します。
 
@@ -140,12 +150,22 @@ class SaintGraph:
     async def process_turn(self, user_input: str, context: Optional[str] = None, wait_after: bool = True):
         """
         単一のインタラクションターンを処理します。
-        AIからのテキスト出力を取得し、随時パースして文章単位でストリーミング的に Body API (TTS) を実行します。
+        AIからのテキスト出力を取得し、文章単位で Body API (TTS) を実行します。
 
         wait_after=False のとき、speak キュー投入まで完了したら return し、再生完了は待たない。
         プリフェッチ用（呼び出し側で wait_for_queue するなど別途同期する）。
         """
         logger.info(f"Turn started. Input: {user_input[:50]}..., Context: {context}")
+        await self.body.change_emotion("silent")
+        sentences = await self._collect_turn_sentences(user_input, context=context)
+        if not sentences:
+            logger.warning("No text output received from AI.")
+            return
+
+        await self._play_sentences(sentences, wait_after=wait_after)
+
+    async def _collect_turn_sentences(self, user_input: str, context: Optional[str] = None) -> List[Tuple[str, str]]:
+        """Gemini のイベントストリームを読み、(感情, 文) のリストへ変換します。"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -168,9 +188,7 @@ class SaintGraph:
                 
                 buffered_text = ""
                 current_emotion = "neutral"
-                # ターン開始時に「無言」状態へリセット（LLMの思考中に口が動かないようにする）
-                await self.body.change_emotion("silent")
-                sentences_spoken = 0
+                collected_sentences: List[Tuple[str, str]] = []
 
                 # AIからのテキスト出力をストリーミング的に処理
                 async for event in self.runner.run_async(
@@ -183,37 +201,20 @@ class SaintGraph:
                     if t:
                         buffered_text += t
                         
-                        # バッファされたテキストから文や感情タグを随時抽出して処理
-                        buffered_text, current_emotion, count = await self._process_buffered_text(
+                        # バッファされたテキストから文や感情タグを随時抽出する
+                        buffered_text, current_emotion, sentences = self._collect_buffered_sentences(
                             buffered_text, current_emotion
                         )
-                        sentences_spoken += count
+                        collected_sentences.extend(sentences)
 
                 # 残りのバッファがあれば最後に処理
                 if buffered_text.strip():
-                    buffered_text, current_emotion, count = await self._process_buffered_text(
+                    buffered_text, current_emotion, sentences = self._collect_buffered_sentences(
                         buffered_text, current_emotion, flush=True
                     )
-                    sentences_spoken += count
-
-                if sentences_spoken > 0:
-                    if wait_after:
-                        # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
-                        logger.info("Waiting for speech to finish before completing turn...")
-                        await self.body.wait_for_queue()
-
-                        # 話し終わったら「無言」状態に切り替える
-                        await self.body.change_emotion("silent")
-
-                        logger.info(f"Turn completed. {sentences_spoken} sentences spoken")
-                    else:
-                        # プリフェッチモード: speak キュー投入まで完了。再生完了は呼び出し側で同期する。
-                        logger.info(f"Turn queued (prefetch). {sentences_spoken} sentences in queue")
-                else:
-                    logger.warning("No text output received from AI.")
+                    collected_sentences.extend(sentences)
                 
-                # 成功したらループを抜ける
-                return
+                return collected_sentences
 
             except Exception as e:
                 # 503 Service Unavailable または Resource Exhausted の場合はリトライ
@@ -232,66 +233,86 @@ class SaintGraph:
 
                 logger.exception("Error in process_turn: %s", e)
                 raise
+
+        return []
+
+    async def _play_sentences(self, sentences: List[Tuple[str, str]], wait_after: bool = True):
+        """生成済みの文を順に発話キューへ投入します。"""
+        sentences_spoken = 0
+        for emotion, sentence in sentences:
+            if not sentence:
+                continue
+            await self.body.change_emotion(emotion)
+            await self._speak_sentence(sentence, emotion)
+            sentences_spoken += 1
+
+        if sentences_spoken == 0:
+            logger.warning("No text output received from AI.")
+            return
+
+        if wait_after:
+            # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
+            logger.info("Waiting for speech to finish before completing turn...")
+            await self.body.wait_for_queue()
+
+            # 話し終わったら「無言」状態に切り替える
+            await self.body.change_emotion("silent")
+
+            logger.info(f"Turn completed. {sentences_spoken} sentences spoken")
+        else:
+            # プリフェッチモード: speak キュー投入まで完了。再生完了は呼び出し側で同期する。
+            logger.info(f"Turn queued (prefetch). {sentences_spoken} sentences in queue")
                 
-    async def _process_buffered_text(self, buffered_text: str, current_emotion: str, flush: bool = False) -> tuple[str, str, int]:
+    def _collect_buffered_sentences(self, buffered_text: str, current_emotion: str, flush: bool = False) -> tuple[str, str, List[Tuple[str, str]]]:
         """
-        バッファされた文字列を解析し、完成した文があればTTSキューに送信。
-        残りの未完成な文字列と現在の感情を返します。
+        バッファされた文字列を解析し、完成した文を (感情, 文) のリストとして返します。
+        Body API は呼ばず、ニュースの先読みで future の発話キューを汚さないために使います。
         """
-        count = 0
+        collected: List[Tuple[str, str]] = []
         while True:
-            # 感情タグのチェックと抽出 (先頭から)
             emotion_match = re.search(r'\[emotion:\s*(\w+)\]', buffered_text)
             if emotion_match:
-                # 感情タグの前のテキストがあれば、現在の感情で即座に発話（感情切り替え前のフラッシュ）
-                pre_text = buffered_text[:emotion_match.start()].strip()
+                pre_text = self._clean_sentence(buffered_text[:emotion_match.start()])
                 if pre_text:
-                    await self._speak_sentence(pre_text, current_emotion)
-                    count += 1
-                
-                # 感情の更新
-                new_emotion = emotion_match.group(1).lower()
-                if new_emotion != current_emotion:
-                    await self.body.change_emotion(new_emotion)
-                    current_emotion = new_emotion
-                
-                # 処理済み部分をバッファから削除
-                buffered_text = buffered_text[emotion_match.end():]
-                continue # タグを処理したら再度ループで次のパーツを探す
+                    collected.append((current_emotion, pre_text))
 
-            # 感情タグがない場合、文の区切りを探す
+                current_emotion = emotion_match.group(1).lower()
+                buffered_text = buffered_text[emotion_match.end():]
+                continue
+
             sentences = self._split_sentences(buffered_text, force_flush=flush)
-            
-            # 区切られた文が1つ以下（=まだ文が完了していない）でflushフラグもない場合は待機
             if not flush and len(sentences) <= 1:
                 break
-                
-            # 完成した文を送信
+
             for i in range(len(sentences) - 1):
-                if sentences[i].strip():
-                    await self._speak_sentence(sentences[i].strip(), current_emotion)
-                    count += 1
-            
-            # バッファの更新
+                sentence = self._clean_sentence(sentences[i])
+                if sentence:
+                    collected.append((current_emotion, sentence))
+
             if len(sentences) > 0:
                 buffered_text = sentences[-1]
-                if flush and buffered_text.strip():
-                    await self._speak_sentence(buffered_text.strip(), current_emotion)
-                    count += 1
+                if flush:
+                    sentence = self._clean_sentence(buffered_text)
+                    if sentence:
+                        collected.append((current_emotion, sentence))
                     buffered_text = ""
             else:
                 buffered_text = ""
             break
-            
-        return buffered_text, current_emotion, count
+
+        return buffered_text, current_emotion, collected
 
     async def _speak_sentence(self, sentence: str, emotion: str):
         """1文を発話キューに入れます。"""
         # 単純なタグは除去
-        sentence = re.sub(r'\[emotion:\s*(\w+)\]', '', sentence).strip()
+        sentence = self._clean_sentence(sentence)
         if sentence:
             logger.debug(f"Streaming sentence to TTS: {sentence[:30]}... (emotion: {emotion})")
             await self.body.speak(sentence, style=emotion, speaker_id=self.speaker_id)
+
+    def _clean_sentence(self, sentence: str) -> str:
+        """文中に残った単純な感情タグを取り除きます。"""
+        return re.sub(r'\[emotion:\s*(\w+)\]', '', sentence).strip()
 
     def _extract_text_from_event(self, event) -> Optional[str]:
         """ADKイベントからテキストを抽出します。"""

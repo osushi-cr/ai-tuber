@@ -32,31 +32,45 @@ def test_change_emotion_api():
         assert response.json()["result"] == "Emotion changed to angry"
         mock_change.assert_called_once_with("angry")
 
-def test_get_comments_api():
-    with patch.object(body_service, "get_comments", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = json.dumps([
+def test_peek_comments_api():
+    with patch.object(body_service, "peek_comments", new_callable=AsyncMock) as mock_peek:
+        mock_peek.return_value = json.dumps([
             {"author": "User", "message": "Test comment 1"},
             {"author": "User", "message": "Test comment 2"}
         ])
         response = client.get("/api/comments")
-        
+
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         comments = response.json()["comments"]
         assert len(comments) == 2
         assert comments[0]["author"] == "User"
         assert comments[0]["message"] == "Test comment 1"
-        mock_get.assert_called_once()
+        mock_peek.assert_called_once()
 
-def test_get_comments_empty_api():
-    with patch.object(body_service, "get_comments", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = json.dumps([])
+def test_peek_comments_empty_api():
+    with patch.object(body_service, "peek_comments", new_callable=AsyncMock) as mock_peek:
+        mock_peek.return_value = json.dumps([])
         response = client.get("/api/comments")
-        
+
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         assert response.json()["comments"] == []
-        mock_get.assert_called_once()
+        mock_peek.assert_called_once()
+
+def test_consume_comments_api():
+    with patch.object(body_service, "consume_comments", new_callable=AsyncMock) as mock_consume:
+        mock_consume.return_value = json.dumps([
+            {"author": "User", "message": "Drained comment"}
+        ])
+        response = client.post("/api/comments/consume")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        comments = response.json()["comments"]
+        assert len(comments) == 1
+        assert comments[0]["message"] == "Drained comment"
+        mock_consume.assert_called_once()
 
 def test_start_broadcast_api():
     with patch.object(body_service, "start_broadcast", new_callable=AsyncMock) as mock_start:

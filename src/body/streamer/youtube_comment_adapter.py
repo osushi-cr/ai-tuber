@@ -6,14 +6,9 @@ import queue
 import os
 import json
 import logging
-from collections import deque
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
-
-# OBS overlay と saint_graph が同じバッファを peek/consume するので、
-# バッファに残るコメント数の上限。古いものから FIFO 削除。
-BUFFER_MAX = 100
 
 
 class YouTubeCommentAdapter:
@@ -56,8 +51,10 @@ class YouTubeCommentAdapter:
         self.error_thread.daemon = True
         self.error_thread.start()
 
-        # peek/consume の双方が参照する内部 buffer（直近 BUFFER_MAX 件まで FIFO）
-        self._buffer: deque = deque(maxlen=BUFFER_MAX)
+        # peek/consume の双方が参照する内部 buffer。saint_graph が consume するたびに drain される。
+        # OBS overlay は peek を繰り返すが seenIds で重複排除するため、上限なしで OK。
+        # 1配信中に未 consume のまま蓄積し続けるのは想定外（saint_graph が落ちている異常時のみ）。
+        self._buffer: list[dict] = []
         self._buffer_lock = threading.Lock()
 
         logger.info(f"Started YouTube comment adapter for video: {video_id}")

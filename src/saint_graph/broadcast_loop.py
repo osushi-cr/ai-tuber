@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import logger, POLL_INTERVAL, MAX_WAIT_CYCLES
 from .saint_graph import SaintGraph
@@ -31,8 +31,8 @@ class BroadcastContext:
     saint_graph: SaintGraph
     news_service: NewsService
     idle_counter: int = 0
-    # 次ニュースのプリフェッチ task（speak キュー投入まで完了させて保持）
-    next_news_task: Optional[asyncio.Task] = None
+    # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
+    next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +59,10 @@ def _filter_meaningful_comments(
     if not comments_data:
         return []
 
+    def _is_question(c: Dict[str, Any]) -> bool:
+        msg = c.get("message") or ""
+        return "?" in msg or "？" in msg
+
     # 1. ノイズ・極短コメント除外
     filtered: List[Dict[str, Any]] = []
     for c in comments_data:
@@ -69,19 +73,26 @@ def _filter_meaningful_comments(
             continue
         filtered.append(c)
 
-    # 2. 同 author は最新（後勝ち）の1件にまとめる
+    # 2. 同 author の重複排除: 質問あり > 質問なし、同種なら最新優先
     by_author: Dict[str, Dict[str, Any]] = {}
     for c in filtered:
         author = c.get("author") or "User"
+        existing = by_author.get(author)
+        if existing is None:
+            by_author[author] = c
+            continue
+        existing_q = _is_question(existing)
+        new_q = _is_question(c)
+        # 既存が質問で新規が非質問の場合は既存を残す
+        if existing_q and not new_q:
+            continue
+        # それ以外（新規が質問 or 両方同種）は新規で上書き＝最新優先
         by_author[author] = c
     deduped = list(by_author.values())
 
     # 3. 質問系を先頭に、その他を後ろに
-    questions = [
-        c for c in deduped
-        if "?" in (c.get("message") or "") or "？" in (c.get("message") or "")
-    ]
-    others = [c for c in deduped if c not in questions]
+    questions = [c for c in deduped if _is_question(c)]
+    others = [c for c in deduped if not _is_question(c)]
 
     return (questions + others)[:max_count]
 
@@ -126,7 +137,7 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。
 
     intro→news1 間の沈黙を最小化するため、intro セリフ生成・再生と並行して
-    news1 のセリフ生成（speak キュー投入まで）を先取りする。
+    news1 のセリフ生成だけを先取りする。
     生成済 task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
     """
     intro_task = asyncio.create_task(ctx.saint_graph.process_intro())
@@ -136,8 +147,8 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
         if first_item:
             logger.info(f"Prefetching news1: {first_item.title}")
             ctx.next_news_task = asyncio.create_task(
-                ctx.saint_graph.process_news_reading(
-                    title=first_item.title, content=first_item.content, wait_after=False
+                ctx.saint_graph.prepare_news_reading_text(
+                    title=first_item.title, content=first_item.content
                 )
             )
 
@@ -151,8 +162,8 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     NEWS: コメント優先で確認し、なければニュースを 1 本読み上げる。
 
     プリフェッチ最適化:
-    - 現ニュースの音声合成は ctx.next_news_task に既に積まれているはず（無ければ即時生成）
-    - 現ニュース再生開始と同時に「次のニュース」のセリフ生成 task をキック
+    - 現ニュースのセリフは ctx.next_news_task に既に生成されているはず（無ければ即時生成）
+    - 現ニュース再生開始前に「次のニュース」のセリフ生成 task をキック
     - 再生完了を wait_for_queue で待機 → 次ループへ
 
     ニュースを全消化したら QA へ遷移する。
@@ -182,16 +193,20 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to update news caption: {e}")
 
-    # 現ニュース: prefetch 済 task があれば await（既にキュー投入済 or 投入直前）、無ければ即時生成
+    # 現ニュース: prefetch 済 task があれば生成結果を使い、無ければ即時生成
     if ctx.next_news_task is not None:
         try:
-            await ctx.next_news_task
+            sentences = await ctx.next_news_task
         except Exception as e:
             logger.warning(f"Prefetched news task failed, falling back to inline generation: {e}")
-            await ctx.saint_graph.process_news_reading(title=item.title, content=item.content, wait_after=False)
+            sentences = await ctx.saint_graph.prepare_news_reading_text(
+                title=item.title, content=item.content
+            )
         ctx.next_news_task = None
     else:
-        await ctx.saint_graph.process_news_reading(title=item.title, content=item.content, wait_after=False)
+        sentences = await ctx.saint_graph.prepare_news_reading_text(
+            title=item.title, content=item.content
+        )
 
     # 現ニュースの index を進める
     ctx.news_service.get_next_item()
@@ -202,10 +217,12 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
         if next_item:
             logger.info(f"Prefetching next news: {next_item.title}")
             ctx.next_news_task = asyncio.create_task(
-                ctx.saint_graph.process_news_reading(
-                    title=next_item.title, content=next_item.content, wait_after=False
+                ctx.saint_graph.prepare_news_reading_text(
+                    title=next_item.title, content=next_item.content
                 )
             )
+
+    await ctx.saint_graph.play_prepared_sentences(sentences, wait_after=False)
 
     # 現ニュースの音声再生完了を待つ（auto-filler 起動条件にも影響するので必須）
     await ctx.saint_graph.body.wait_for_queue()
@@ -318,6 +335,17 @@ async def _switch_bgm_for_phase(
         logger.warning(f"Failed to switch BGM for phase {phase.value}: {e}")
 
 
+async def _cancel_pending_tasks(ctx: BroadcastContext) -> None:
+    """ループ終了時に未完了の prefetch task をキャンセルしてリーク防止する。"""
+    if ctx.next_news_task is not None and not ctx.next_news_task.done():
+        ctx.next_news_task.cancel()
+        try:
+            await ctx.next_news_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    ctx.next_news_task = None
+
+
 async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     """
     ステートマシンのメインループ。
@@ -335,26 +363,29 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
     await _switch_bgm_for_phase(ctx, phase, with_se=False)
 
-    while phase is not None:
-        try:
-            handler = _HANDLERS[phase]
-            next_phase = await handler(ctx)
+    try:
+        while phase is not None:
+            try:
+                handler = _HANDLERS[phase]
+                next_phase = await handler(ctx)
 
-            if next_phase is not None:
-                if next_phase != phase:
-                    logger.info(f"Phase transition: {phase.value} -> {next_phase.value}")
-                    # フェーズ遷移時はシーン切替 SE を入れて BGM を切り替える
-                    await _switch_bgm_for_phase(ctx, next_phase, with_se=True)
-                phase = next_phase
-                await asyncio.sleep(POLL_INTERVAL)
-            else:
-                # CLOSING ハンドラが None を返した → 終了
-                logger.info(f"Phase {phase.value} completed. Exiting loop.")
-                phase = None
+                if next_phase is not None:
+                    if next_phase != phase:
+                        logger.info(f"Phase transition: {phase.value} -> {next_phase.value}")
+                        # フェーズ遷移時はシーン切替 SE を入れて BGM を切り替える
+                        await _switch_bgm_for_phase(ctx, next_phase, with_se=True)
+                    phase = next_phase
+                    await asyncio.sleep(POLL_INTERVAL)
+                else:
+                    # CLOSING ハンドラが None を返した → 終了
+                    logger.info(f"Phase {phase.value} completed. Exiting loop.")
+                    phase = None
 
-        except Exception as e:
-            logger.error(f"Unexpected error in phase {phase.value}: {e}", exc_info=True)
-            await asyncio.sleep(5)
-        except BaseException as e:
-            logger.critical(f"Critical System Error in phase {phase.value}: {e}", exc_info=True)
-            raise
+            except Exception as e:
+                logger.error(f"Unexpected error in phase {phase.value}: {e}", exc_info=True)
+                await asyncio.sleep(5)
+            except BaseException as e:
+                logger.critical(f"Critical System Error in phase {phase.value}: {e}", exc_info=True)
+                raise
+    finally:
+        await _cancel_pending_tasks(ctx)

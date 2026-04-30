@@ -106,9 +106,84 @@ async def test_process_turn_defaults_to_neutral(mock_adk):
     from unittest.mock import call
     sg.body.change_emotion.assert_has_calls([
         call("silent"),
+        call("neutral"),
         call("silent")
     ])
     sg.body.speak.assert_called_once_with("No tag here", style="neutral", speaker_id=None)
+
+@pytest.mark.asyncio
+async def test_prepare_news_reading_text_collects_without_speaking(mock_adk):
+    # Setup
+    mock_body = mock_adk["BodyClient"]()
+    templates = {"news_reading": "Here is {title}: {content}"}
+    sg = SaintGraph(mock_body, "", "Instruction", templates=templates)
+    sg.body.change_emotion = AsyncMock()
+    sg.body.speak = AsyncMock()
+    sg.body.wait_for_queue = AsyncMock()
+
+    mock_run_async = MagicMock()
+    async def mock_iter(*args, **kwargs):
+        yield MockEvent("[emotion: joyful] Hello World")
+
+    mock_run_async.side_effect = mock_iter
+    sg.runner.run_async = mock_run_async
+
+    sg.runner.app_name = "TestApp"
+    sg.runner.session_service = AsyncMock()
+    sg.runner.session_service.get_session = AsyncMock(return_value="ExistingSession")
+
+    # Execute
+    sentences = await sg.prepare_news_reading_text("MyTopic", "MyContent")
+
+    # Verify
+    assert sentences == [("joyful", "Hello World")]
+    sg.body.change_emotion.assert_not_called()
+    sg.body.speak.assert_not_called()
+    sg.body.wait_for_queue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_play_prepared_sentences_speaks_and_waits(mock_adk):
+    # Setup
+    mock_body = mock_adk["BodyClient"]()
+    sg = SaintGraph(mock_body, "", "Instruction", mind_config={"speaker_id": 8})
+    sg.body.change_emotion = AsyncMock()
+    sg.body.speak = AsyncMock()
+    sg.body.wait_for_queue = AsyncMock()
+
+    # Execute
+    await sg.play_prepared_sentences([("joyful", "Hello"), ("sad", "Bye")])
+
+    # Verify
+    from unittest.mock import call
+    sg.body.change_emotion.assert_has_calls([
+        call("joyful"),
+        call("sad"),
+        call("silent"),
+    ])
+    sg.body.speak.assert_has_calls([
+        call("Hello", style="joyful", speaker_id=8),
+        call("Bye", style="sad", speaker_id=8),
+    ])
+    sg.body.wait_for_queue.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_play_prepared_sentences_can_skip_wait(mock_adk):
+    # Setup
+    mock_body = mock_adk["BodyClient"]()
+    sg = SaintGraph(mock_body, "", "Instruction")
+    sg.body.change_emotion = AsyncMock()
+    sg.body.speak = AsyncMock()
+    sg.body.wait_for_queue = AsyncMock()
+
+    # Execute
+    await sg.play_prepared_sentences([("neutral", "Hello")], wait_after=False)
+
+    # Verify
+    sg.body.change_emotion.assert_called_once_with("neutral")
+    sg.body.speak.assert_called_once_with("Hello", style="neutral", speaker_id=None)
+    sg.body.wait_for_queue.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_high_level_process_methods(mock_adk):
@@ -129,7 +204,9 @@ async def test_high_level_process_methods(mock_adk):
 
     # Execute & Verify process_news_reading
     await sg.process_news_reading("MyTopic", "MyContent")
-    sg.process_turn.assert_called_with("Here is MyTopic: MyContent", context="News Reading: MyTopic")
+    sg.process_turn.assert_called_with(
+        "Here is MyTopic: MyContent", context="News Reading: MyTopic", wait_after=True
+    )
 
     # Execute & Verify process_news_finished
     await sg.process_news_finished()
