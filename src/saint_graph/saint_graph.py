@@ -326,8 +326,14 @@ class SaintGraph:
 
         if wait_after:
             # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
+            # auto_filler が並走して queue にアクションを継続投入する状況でも、
+            # 自分が投入した speak action_ids だけを strict 待ちする。 全 queue の
+            # 空を待つと auto_filler の chitchat 投入で永久ハングする。
             logger.info("Waiting for speech to finish before completing turn...")
-            await self.body.wait_for_queue()
+            if speak_action_ids:
+                await self.body.wait_for_queue_strict(action_ids=speak_action_ids)
+            else:
+                await self.body.wait_for_queue()
 
             # 話し終わったら「無言」状態に切り替える
             await self.body.change_emotion("silent")

@@ -55,6 +55,7 @@ async def test_process_turn_parses_emotion_tag(mock_adk):
     sg.body.change_emotion = AsyncMock()
     sg.body.queue_speak = AsyncMock(return_value={"action_id": "speak-1"})
     sg.body.wait_for_queue = AsyncMock()
+    sg.body.wait_for_queue_strict = AsyncMock(return_value=True)
     
     mock_run_async = MagicMock()
     async def mock_iter(*args, **kwargs):
@@ -87,6 +88,7 @@ async def test_process_turn_defaults_to_neutral(mock_adk):
     sg.body.change_emotion = AsyncMock()
     sg.body.queue_speak = AsyncMock(return_value={"action_id": "speak-1"})
     sg.body.wait_for_queue = AsyncMock()
+    sg.body.wait_for_queue_strict = AsyncMock(return_value=True)
     
     mock_run_async = MagicMock()
     async def mock_iter(*args, **kwargs):
@@ -153,6 +155,7 @@ async def test_play_prepared_sentences_speaks_and_waits(mock_adk):
         {"action_id": "speak-2"},
     ])
     sg.body.wait_for_queue = AsyncMock()
+    sg.body.wait_for_queue_strict = AsyncMock(return_value=True)
 
     # Execute
     action_id = await sg.play_prepared_sentences([("joyful", "Hello"), ("sad", "Bye")])
@@ -168,8 +171,42 @@ async def test_play_prepared_sentences_speaks_and_waits(mock_adk):
         call("Hello", style="joyful", speaker_id=8),
         call("Bye", style="sad", speaker_id=8),
     ])
-    sg.body.wait_for_queue.assert_called_once()
+    # auto_filler 並走中のハング回避のため、 全 queue ではなく自分が投入した
+    # speak action_ids だけを strict 待ちする
+    sg.body.wait_for_queue_strict.assert_called_once_with(
+        action_ids=["speak-1", "speak-2"]
+    )
+    sg.body.wait_for_queue.assert_not_called()
     assert action_id == "speak-1"
+
+
+@pytest.mark.asyncio
+async def test_play_prepared_sentences_waits_only_for_own_speak_actions(mock_adk):
+    """回帰テスト: process_turn / play_prepared_sentences の wait_after=True が
+    全 action_queue の空を待つと、 auto_filler が並走している状況で永遠にハングする。
+    自分が投入した speak action_ids だけを strict 待ちすることでハングを避ける。
+    """
+    mock_body = mock_adk["BodyClient"]()
+    sg = SaintGraph(mock_body, "", "Instruction")
+    sg.body.change_emotion = AsyncMock()
+    sg.body.queue_speak = AsyncMock(side_effect=[
+        {"action_id": "speak-A"},
+        {"action_id": "speak-B"},
+        {"action_id": "speak-C"},
+    ])
+    sg.body.wait_for_queue = AsyncMock()
+    sg.body.wait_for_queue_strict = AsyncMock(return_value=True)
+
+    await sg.play_prepared_sentences(
+        [("neutral", "one"), ("joyful", "two"), ("sad", "three")]
+    )
+
+    # 全 queue を待つ wait_for_queue は呼ばれない（auto_filler ハング回避の本旨）
+    sg.body.wait_for_queue.assert_not_called()
+    # 投入した 3 件すべての action_id が strict 待ち対象に含まれる
+    sg.body.wait_for_queue_strict.assert_called_once_with(
+        action_ids=["speak-A", "speak-B", "speak-C"]
+    )
 
 
 @pytest.mark.asyncio
