@@ -6,9 +6,11 @@ BroadcastPhase (Enum) と各フェーズのハンドラで構成されます。
 """
 import asyncio
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import logger, POLL_INTERVAL, MAX_WAIT_CYCLES
@@ -443,12 +445,39 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
 
 
 async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
-    """CLOSING: 締めの挨拶をしてリソースを解放する。None を返しループ終了。"""
-    await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
+    """CLOSING: 事前生成 closing wav プールからランダム選択して再生する。
 
-    # すべての発話が完了するまで待機（キューの消化待機）
-    logger.info("Waiting for final speech to complete...")
-    await ctx.saint_graph.body.wait_for_queue()
+    プール (`CLOSING_POOL_DIR` / data/mind/kurara/closings/closing_*.wav) が
+    空の場合は従来通り Gemini で生成して再生する。
+    None を返しループ終了。
+    """
+    closings_dir = Path(os.getenv("CLOSING_POOL_DIR", "data/mind/kurara/closings"))
+    candidates = (
+        sorted(closings_dir.glob("closing_*.wav")) if closings_dir.exists() else []
+    )
+
+    if candidates:
+        chosen = random.choice(candidates)
+        logger.info(f"Closing: playing pre-generated wav: {chosen.name}")
+        try:
+            result = await ctx.saint_graph.body.queue_filler(
+                file_path=str(chosen), style="joyful"
+            )
+            action_id = (
+                result.get("action_id") if isinstance(result, dict) else None
+            )
+            if action_id:
+                await ctx.saint_graph.body.wait_for_queue_strict(
+                    action_ids=[action_id]
+                )
+        except Exception as e:
+            logger.warning(
+                f"Closing pool playback failed ({e}), falling back to Gemini"
+            )
+            await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
+    else:
+        logger.info("Closing pool not found, generating via Gemini")
+        await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
 
     # 配信終了画面へシーン切替（ending イラスト＋BGM）
     ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")

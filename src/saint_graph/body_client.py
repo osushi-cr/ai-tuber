@@ -188,14 +188,51 @@ class BodyClient:
         data = await self.queue_bgm_stop(bgm_id)
         return data.get("result", f"BGM {bgm_id} stopped")
 
-    async def play_filler(self, category: str, style: str = "neutral") -> str:
-        """category 該当の filler wav をランダムで voice ソースに流す。"""
-        data = await self._request(
-            "POST", "/api/filler/play", {"category": category, "style": style}
-        )
+    async def play_filler(
+        self,
+        category: Optional[str] = None,
+        style: str = "neutral",
+        file_path: Optional[str] = None,
+    ) -> str:
+        """voice ソースに wav を流す（戻り値は文字列メッセージのみ）。
+
+        - file_path 指定時はそのパスを再生
+        - 未指定時は category から filler wav をランダム選択
+        """
+        data = await self._filler_payload(category, style, file_path)
+        if data is None:
+            return "Error: play_filler requires either category or file_path"
+        label = file_path or category
         if data:
-            return data.get("result", f"Filler {category} queued")
-        return f"Error: Failed to play filler {category}"
+            return data.get("result", f"Filler {label} queued")
+        return f"Error: Failed to play filler {label}"
+
+    async def queue_filler(
+        self,
+        category: Optional[str] = None,
+        style: str = "neutral",
+        file_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """filler 再生を queue 投入し action_id を含む dict を返す。
+        action_id を使って `wait_for_queue_strict([action_id])` で完了同期できる。
+        """
+        data = await self._filler_payload(category, style, file_path)
+        return data or {}
+
+    async def _filler_payload(
+        self,
+        category: Optional[str],
+        style: str,
+        file_path: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        payload: Dict[str, Any] = {"style": style}
+        if file_path is not None:
+            payload["file_path"] = file_path
+        elif category is not None:
+            payload["category"] = category
+        else:
+            return None
+        return await self._request("POST", "/api/filler/play", payload)
 
     async def queue_auto_filler_start(self) -> Dict[str, Any]:
         """auto-filler 開始 action を presentation queue に投入する。"""

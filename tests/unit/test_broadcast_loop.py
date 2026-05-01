@@ -525,6 +525,60 @@ async def test_handle_closing_passes_technical_failure_reason():
 
 
 @pytest.mark.asyncio
+async def test_handle_closing_uses_closing_pool_when_available(monkeypatch, tmp_path):
+    """CLOSING_POOL_DIR に closing_*.wav があれば Gemini を使わずプールから再生する。"""
+    import wave
+
+    pool_dir = tmp_path / "closings"
+    pool_dir.mkdir()
+    for i in range(1, 4):
+        wav_path = pool_dir / f"closing_{i:02d}.wav"
+        with wave.open(str(wav_path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"")
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
+
+    ctx = _make_ctx()
+    ctx.saint_graph.body.queue_filler = AsyncMock(
+        return_value={"action_id": "closing-action"}
+    )
+
+    phase = await handle_closing(ctx)
+
+    assert phase is None
+    # Gemini は呼ばない
+    ctx.saint_graph.process_closing.assert_not_called()
+    # プールから 1 件選ばれて queue_filler に渡される
+    ctx.saint_graph.body.queue_filler.assert_called_once()
+    call_kwargs = ctx.saint_graph.body.queue_filler.call_args.kwargs
+    assert call_kwargs["file_path"].endswith(".wav")
+    assert "closing_" in call_kwargs["file_path"]
+    # action_id を strict 待ち
+    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(
+        action_ids=["closing-action"]
+    )
+    # ending シーン切替
+    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("ending")
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_falls_back_to_gemini_when_pool_empty(monkeypatch, tmp_path):
+    """CLOSING_POOL_DIR が存在しても wav が無ければ Gemini フォールバック。"""
+    pool_dir = tmp_path / "closings"
+    pool_dir.mkdir()
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
+
+    ctx = _make_ctx()
+    with patch("asyncio.sleep", return_value=None):
+        phase = await handle_closing(ctx)
+
+    assert phase is None
+    ctx.saint_graph.process_closing.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog):
     caplog.set_level("WARNING", logger="saint-graph")
     ctx = _make_ctx()

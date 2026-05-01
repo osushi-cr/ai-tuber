@@ -179,14 +179,20 @@ class BodyApp:
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
     async def filler_play_api(self, request: Request) -> JSONResponse:
-        """category 指定でフィラー音声を1個ランダム再生する。"""
+        """category または file_path 指定でフィラー音声を再生する。"""
         try:
             body = await request.json()
             category = body.get("category")
+            file_path = body.get("file_path")
             style = body.get("style", "neutral")
-            if not category:
-                return JSONResponse({"status": "error", "message": "missing 'category'"}, status_code=400)
-            result = await self.service.play_filler(category, style)
+            if not category and not file_path:
+                return JSONResponse(
+                    {"status": "error", "message": "missing 'category' or 'file_path'"},
+                    status_code=400,
+                )
+            result = await self.service.play_filler(
+                category=category, style=style, file_path=file_path
+            )
             return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in filler/play API: {e}")

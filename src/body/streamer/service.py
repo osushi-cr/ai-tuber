@@ -309,23 +309,42 @@ class StreamerBodyService(BodyServiceBase):
         logger.info(f"[change_emotion:queued] {emotion}")
         return result
 
-    async def play_filler(self, category: str, style: str = "neutral") -> Dict[str, Any] | str:
-        """category 該当の filler wav をランダム選択して voice ソースで再生します。
+    async def play_filler(
+        self,
+        category: Optional[str] = None,
+        style: str = "neutral",
+        file_path: Optional[str] = None,
+    ) -> Dict[str, Any] | str:
+        """voice ソースで wav を再生します。
+
+        - file_path 指定時はそのパスをそのまま再生（任意の事前生成済 wav を流せる）
+        - 未指定時は FILLER_VOICE_DIR 配下の `filler_<category>_*.wav` からランダム選択
 
         category: "aizuchi" / "thinking" / "reaction" / "intro" / "outro" 等。
-        FILLER_VOICE_DIR 配下の `filler_<category>_*.wav` から1つランダム選択する。
         """
-        if not FILLER_VOICE_DIR.exists():
-            return f"FILLER_VOICE_DIR not found: {FILLER_VOICE_DIR}"
-        candidates = sorted(FILLER_VOICE_DIR.glob(f"filler_{category}_*.wav"))
-        if not candidates:
-            return f"No filler wav found for category: {category}"
-        chosen = random.choice(candidates)
+        if file_path is not None:
+            chosen_path = file_path
+            label = Path(file_path).name
+        else:
+            if category is None:
+                return "play_filler requires either category or file_path"
+            if not FILLER_VOICE_DIR.exists():
+                return f"FILLER_VOICE_DIR not found: {FILLER_VOICE_DIR}"
+            candidates = sorted(FILLER_VOICE_DIR.glob(f"filler_{category}_*.wav"))
+            if not candidates:
+                return f"No filler wav found for category: {category}"
+            chosen = random.choice(candidates)
+            chosen_path = str(chosen)
+            label = chosen.name
+
         result = await self._enqueue_action("filler", {
-            "file_path": str(chosen),
+            "file_path": chosen_path,
             "style": style,
-        }, f"Filler queued: {chosen.name}")
-        logger.info(f"[filler:queued] category={category} file={chosen.name}")
+        }, f"Filler queued: {label}")
+        logger.info(
+            f"[filler:queued] {'file_path' if file_path else 'category'}="
+            f"{file_path or category} file={label}"
+        )
         return result
 
     async def play_bgm(self, bgm_id: str, restart: bool = True) -> Dict[str, Any]:
