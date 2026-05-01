@@ -136,8 +136,10 @@ async def test_handle_news_reading():
         wait_after=False,
     )
     ctx.saint_graph.body.queue_scene_switch.assert_called_once()
+    # scene strict と speak strict は別呼出（仕様変更で speak の retry を撤去）
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action", "speak-action"]),
+        call(["scene-action"]),
+        call(["speak-action"]),
     ])
     ctx.saint_graph.body.wait_for_queue.assert_not_called()
     ctx.saint_graph.process_news_reading.assert_not_called()
@@ -174,7 +176,8 @@ async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
     )
     ctx.saint_graph.body.queue_scene_switch.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action", "speak-action"]),
+        call(["scene-action"]),
+        call(["speak-action"]),
     ])
     ctx.saint_graph.body.wait_for_queue.assert_not_called()
     ctx.saint_graph.process_news_reading.assert_not_called()
@@ -186,7 +189,8 @@ async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
 
 
 @pytest.mark.asyncio
-async def test_handle_news_retries_failed_presentation_setup_then_closes():
+async def test_handle_news_scene_strict_retries_then_closes_on_double_failure():
+    """scene strict は retry 付き helper（_queue_and_wait_strict）。 2 回失敗で CLOSING、 speak は投入されない。"""
     news_service = MagicMock()
     news_service.has_next.side_effect = [True, False]
     item = MagicMock()
@@ -207,13 +211,14 @@ async def test_handle_news_retries_failed_presentation_setup_then_closes():
     assert ctx.closing_reason == "technical_failure"
     assert ctx.saint_graph.body.queue_scene_switch.call_count == 2
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-1", "speak-action"]),
-        call(["scene-2", "speak-action"]),
+        call(["scene-1"]),
+        call(["scene-2"]),
     ])
     ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
         title="Title", content="Content"
     )
-    assert ctx.saint_graph.play_prepared_sentences_with_caption.call_count == 2
+    # scene 確定前に CLOSING へフォールバックするため speak は投入されない
+    ctx.saint_graph.play_prepared_sentences_with_caption.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -240,81 +245,58 @@ async def test_handle_intro_closes_when_main_scene_strict_fails():
 
 
 @pytest.mark.asyncio
-async def test_handle_intro_retries_waiting_scene_then_succeeds():
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"action_id": "waiting-1"},
-        {"action_id": "waiting-2"},
-        {"action_id": "main"},
-    ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, True, True]
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.body.queue_scene_switch.assert_has_calls([
-        call("waiting"),
-        call("waiting"),
-        call("kurara_main"),
-    ])
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["waiting-1"]),
-        call(["waiting-2"]),
-        call(["main"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_continues_when_waiting_scene_fails_twice(caplog):
+async def test_handle_intro_continues_when_waiting_scene_fails_once(caplog):
+    """waiting scene は best-effort（once helper）のため、 失敗しても retry せず loop は継続する。"""
     caplog.set_level("WARNING", logger="saint-graph")
     news_service = MagicMock()
     news_service.has_next.return_value = False
     ctx = _make_ctx(news_service=news_service)
     ctx.saint_graph.body.queue_scene_switch.side_effect = [
         {"action_id": "waiting-1"},
-        {"action_id": "waiting-2"},
         {"action_id": "main"},
     ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, False, True]
+    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, True]
 
     phase = await handle_intro(ctx)
 
     assert phase == BroadcastPhase.NEWS
     assert ctx.closing_reason is None
-    assert "INTRO start waiting_scene failed on attempt 2" in caplog.text
+    assert "INTRO start waiting_scene failed" in caplog.text
+    # waiting は 1 回投入のみ（retry なし）、 続いて main 切替
+    ctx.saint_graph.body.queue_scene_switch.assert_has_calls([
+        call("waiting"),
+        call("kurara_main"),
+    ])
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
         call(["waiting-1"]),
-        call(["waiting-2"]),
         call(["main"]),
     ])
 
 
 @pytest.mark.asyncio
-async def test_handle_intro_retries_waiting_scene_without_action_id():
+async def test_handle_intro_continues_when_waiting_scene_has_no_action_id():
+    """waiting の queue 投入で action_id が返らなくても、 loop は止めず main 切替へ進む。"""
     news_service = MagicMock()
     news_service.has_next.return_value = False
     ctx = _make_ctx(news_service=news_service)
     ctx.saint_graph.body.queue_scene_switch.side_effect = [
         {"status": "error"},
-        {"action_id": "waiting-2"},
         {"action_id": "main"},
     ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [True, True]
+    ctx.saint_graph.body.wait_for_queue_strict.return_value = True
 
     phase = await handle_intro(ctx)
 
     assert phase == BroadcastPhase.NEWS
+    # action_id 欠落時のフォールバックとして wait_for_queue が呼ばれる
     ctx.saint_graph.body.wait_for_queue.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["waiting-2"]),
-        call(["main"]),
-    ])
+    # main 切替の strict は実行される
+    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with(["main"])
 
 
 @pytest.mark.asyncio
-async def test_handle_news_retries_failed_speak_caption_then_succeeds():
+async def test_handle_news_scene_strict_retry_then_speak_succeeds():
+    """scene strict は retry 付き、 speak strict は retry なしで成功する正常パス。"""
     news_service = MagicMock()
     news_service.has_next.side_effect = [True, False]
     item = MagicMock()
@@ -324,42 +306,35 @@ async def test_handle_news_retries_failed_speak_caption_then_succeeds():
     news_service.get_next_item.return_value = item
 
     ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.play_prepared_sentences_with_caption.side_effect = [
-        ["speak-1"],
-        ["speak-2"],
-    ]
+    ctx.saint_graph.play_prepared_sentences_with_caption.return_value = ["speak-1"]
     ctx.saint_graph.body.wait_for_queue_strict.side_effect = [
-        False,  # caption 同梱 speak 失敗
-        True,   # retry 成功
+        False,  # scene strict 1 回目失敗
+        True,   # scene strict retry で成功
+        True,   # speak strict 成功
     ]
 
     phase = await handle_news(ctx)
 
     assert phase == BroadcastPhase.NEWS
     assert ctx.closing_reason is None
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_has_calls([
-        call(
-            [("neutral", "本文")],
-            caption_title="Title",
-            caption_summary="Content",
-            wait_after=False,
-        ),
-        call(
-            [("neutral", "本文")],
-            caption_title="Title",
-            caption_summary="Content",
-            wait_after=False,
-        ),
-    ])
+    # play_prepared_sentences_with_caption は scene 確定後に 1 回だけ呼ばれる（retry なし）
+    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once_with(
+        [("neutral", "本文")],
+        caption_title="Title",
+        caption_summary="Content",
+        wait_after=False,
+    )
+    # strict は scene 2 回（retry）と speak 1 回の合計 3 回
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action", "speak-1"]),
-        call(["scene-action", "speak-2"]),
+        call(["scene-action"]),
+        call(["scene-action"]),
+        call(["speak-1"]),
     ])
-    ctx.saint_graph.body.wait_for_queue.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_handle_news_strict_checks_all_speak_action_ids():
+    """speak strict は全 speak action_id を一括で確認する（scene strict とは別呼出）。"""
     news_service = MagicMock()
     news_service.has_next.side_effect = [True, False]
     item = MagicMock()
@@ -381,15 +356,16 @@ async def test_handle_news_strict_checks_all_speak_action_ids():
     phase = await handle_news(ctx)
 
     assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with([
-        "scene-action",
-        "speak-1",
-        "speak-2",
+    # scene strict と speak strict は別呼出。speak 側は全 ids 一括
+    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
+        call(["scene-action"]),
+        call(["speak-1", "speak-2"]),
     ])
 
 
 @pytest.mark.asyncio
-async def test_handle_news_failed_speak_caption_twice_closes_with_reason():
+async def test_handle_news_speak_failure_closes_immediately_without_retry():
+    """speak strict 失敗は retry せず即 CLOSING/technical_failure。 二重発話を避ける。"""
     news_service = MagicMock()
     news_service.has_next.side_effect = [True, False]
     item = MagicMock()
@@ -399,22 +375,21 @@ async def test_handle_news_failed_speak_caption_twice_closes_with_reason():
     news_service.get_next_item.return_value = item
 
     ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.play_prepared_sentences_with_caption.side_effect = [
-        ["speak-1"],
-        ["speak-2"],
-    ]
+    ctx.saint_graph.play_prepared_sentences_with_caption.return_value = ["speak-1"]
     ctx.saint_graph.body.wait_for_queue_strict.side_effect = [
-        False,
-        False,
+        True,   # scene strict 成功
+        False,  # speak strict 失敗（retry なし）
     ]
 
     phase = await handle_news(ctx)
 
     assert phase == BroadcastPhase.CLOSING
     assert ctx.closing_reason == "technical_failure"
+    # play_prepared_sentences_with_caption は 1 回しか呼ばれない（retry なしで二重発話を回避）
+    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action", "speak-1"]),
-        call(["scene-action", "speak-2"]),
+        call(["scene-action"]),
+        call(["speak-1"]),
     ])
 
 

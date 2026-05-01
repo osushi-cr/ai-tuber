@@ -107,15 +107,6 @@ def _extract_action_id(response: Any) -> Optional[str]:
     return None
 
 
-async def _queue_news_entry_presentation(ctx: BroadcastContext) -> Optional[str]:
-    """NEWS 入口で必須の scene 切替を queue 経由で投入し、action_id を返す。"""
-    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-    response = await ctx.saint_graph.body.queue_scene_switch(main_scene)
-    action_id = _extract_action_id(response)
-    if not action_id:
-        logger.warning("NEWS presentation setup did not return action_id")
-        return None
-    return action_id
 
 
 async def _queue_and_wait_strict(ctx: BroadcastContext, queue_call, label: str) -> bool:
@@ -180,46 +171,46 @@ async def _queue_caption_clear_strict(ctx: BroadcastContext) -> bool:
     )
 
 
-async def _play_news_sentences_with_retry(
+async def _play_news_sentences(
     ctx: BroadcastContext,
     sentences: List[Tuple[str, str]],
     caption_title: str,
     caption_summary: str,
 ) -> bool:
-    """caption 同期付き speak を投入し、caption/音声失敗を 1 回だけ retry する。"""
-    for attempt in range(2):
-        try:
-            scene_action_id = await _queue_news_entry_presentation(ctx)
-            if not scene_action_id:
-                await ctx.saint_graph.body.wait_for_queue()
-                ok = False
-            else:
-                speak_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
-                    sentences,
-                    caption_title=caption_title,
-                    caption_summary=caption_summary,
-                    wait_after=False,
-                )
-                if not speak_action_ids:
-                    logger.warning("NEWS speak did not return action_id")
-                    await ctx.saint_graph.body.wait_for_queue()
-                    ok = False
-                else:
-                    ok = await ctx.saint_graph.body.wait_for_queue_strict(
-                        [scene_action_id, *speak_action_ids]
-                    )
+    """NEWS 入口で scene を retry 付き strict 確認、 speak は retry なしで strict 確認する。
 
-            if ok:
-                return True
-            if attempt == 0:
-                logger.warning("NEWS speak/caption action failed on attempt 1; retrying once")
-            else:
-                logger.warning("NEWS speak/caption action failed on attempt 2")
-        except Exception as e:
-            logger.warning(f"NEWS speak/caption action error on attempt {attempt + 1}: {e}")
+    speak は 1 回目で部分再生（音声生成→caption update→play_audio 途中失敗）が起きると
+    retry で同じセリフが再投入されて視聴者には二重発話に聞こえるため、 retry は撤去。
+    失敗時は False を返し、呼び出し側 (handle_news) で CLOSING/technical_failure へフォールバックする。
+    """
+    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+    scene_ok = await _queue_scene_switch_strict(
+        ctx, main_scene, "NEWS entry scene_switch"
+    )
+    if not scene_ok:
+        return False
 
-    logger.warning("NEWS speak/caption action failed twice. Falling back to CLOSING.")
-    return False
+    try:
+        speak_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
+            sentences,
+            caption_title=caption_title,
+            caption_summary=caption_summary,
+            wait_after=False,
+        )
+        if not speak_action_ids:
+            logger.warning("NEWS speak did not return action_id")
+            await ctx.saint_graph.body.wait_for_queue()
+            return False
+
+        ok = await ctx.saint_graph.body.wait_for_queue_strict(speak_action_ids)
+        if not ok:
+            logger.warning(
+                "NEWS speak/caption action failed (no retry; falling back to CLOSING)"
+            )
+        return ok
+    except Exception as e:
+        logger.warning(f"NEWS speak/caption action error: {e}")
+        return False
 
 
 async def _poll_and_respond(ctx: BroadcastContext) -> bool:
@@ -265,10 +256,12 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     news1 のセリフ生成だけを先取りする。
     生成済 task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
     """
+    # waiting scene は配信開始前演出のための補助 scene で、 失敗しても fatal ではない。
+    # retry は走らせず、 strict 確認も 1 回（best-effort）に留める。
     waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
-    await _queue_scene_switch_strict(
+    await _queue_and_wait_strict_once(
         ctx,
-        waiting_scene,
+        lambda: ctx.saint_graph.body.queue_scene_switch(waiting_scene),
         "INTRO start waiting_scene",
     )
 
@@ -362,7 +355,8 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
 
     # 現ニュースの caption 同期と音声再生完了を strict に確認する。
     # caption は最初の speak action 内で更新されるため、speak action_id を監視する。
-    if not await _play_news_sentences_with_retry(
+    # scene は retry 付き helper で確認、speak は retry なし（部分再生→retry の二重発話を回避）。
+    if not await _play_news_sentences(
         ctx,
         sentences,
         caption_title=item.title,
