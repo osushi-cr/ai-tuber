@@ -64,3 +64,6 @@ data/mind/*/installed_libraries/
 
 node_modules/
 package-lock.json
+
+# 事前生成 closing wav（scripts/generate_closing_pool.py で再生成可能）
+data/mind/kurara/closings/*.wav
