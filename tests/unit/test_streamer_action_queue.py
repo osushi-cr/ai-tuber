@@ -26,10 +26,6 @@ async def test_presentation_actions_are_processed_in_queue_order(monkeypatch, tm
     _write_empty_wav(filler_file)
     monkeypatch.setattr(service_module, "FILLER_VOICE_DIR", tmp_path)
 
-    async def update_caption(title, summary):
-        events.append(("caption_news", title, summary))
-        return True
-
     async def switch_scene(scene):
         events.append(("scene_switch", scene))
         return True
@@ -53,7 +49,6 @@ async def test_presentation_actions_are_processed_in_queue_order(monkeypatch, tm
     async def set_visible_source(emotion):
         return "ok"
 
-    monkeypatch.setattr(service_module.obs_adapter, "update_news_caption", update_caption)
     monkeypatch.setattr(service_module.obs_adapter, "switch_scene", switch_scene)
     monkeypatch.setattr(service_module.obs_adapter, "switch_bgm", switch_bgm)
     monkeypatch.setattr(service_module.obs_adapter, "play_bgm", play_bgm)
@@ -75,14 +70,21 @@ async def test_presentation_actions_are_processed_in_queue_order(monkeypatch, tm
         action_ids = [r["action_id"] for r in results]
 
         assert await svc.wait_for_queue_strict(action_ids) is True
+        # caption_news は内部 _caption_state を更新するだけで OBS API を叩かないため
+        # events には出ない。 worker キューが順序通り処理されたことは scene→bgm→filler の
+        # 並びと、 末尾で _caption_state が反映されていることで確認する。
         assert events == [
-            ("caption_news", "Title", "Summary"),
             ("scene_switch", "kurara_main"),
             ("bgm_switch", "news"),
             ("bgm_play", "se", True),
             ("bgm_stop", "se"),
             ("filler", str(filler_file), "neutral"),
         ]
+        state = svc.get_caption_state()
+        assert state["type"] == "news"
+        assert state["title"] == "Title"
+        assert state["summary"] == "Summary"
+        assert state["visible"] is True
     finally:
         await svc.stop_worker()
 
@@ -121,18 +123,15 @@ async def test_auto_filler_start_and_stop_are_queue_actions(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_speak_caption_is_updated_after_generation_before_playback(monkeypatch):
+    """音声生成完了 → caption 内部 state 更新 → 再生 の順番（D6 caption-speak 同期）。"""
     events = []
 
     async def generate_and_save(text, style, speaker_id):
         events.append("generate")
         return "/tmp/test.wav", 0.0
 
-    async def update_caption(title, summary):
-        events.append(("caption", title, summary))
-        return True
-
     async def play_audio(self, file_path, duration, style):
-        events.append("play")
+        events.append(("play", svc.get_caption_state()["title"]))
         return True
 
     async def set_visible_source(emotion):
@@ -140,7 +139,6 @@ async def test_speak_caption_is_updated_after_generation_before_playback(monkeyp
         return "ok"
 
     monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
-    monkeypatch.setattr(service_module.obs_adapter, "update_news_caption", update_caption)
     monkeypatch.setattr(service_module.obs_adapter, "set_visible_source", set_visible_source)
     monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
 
@@ -155,7 +153,14 @@ async def test_speak_caption_is_updated_after_generation_before_playback(monkeyp
         )
 
         assert await svc.wait_for_queue_strict([result["action_id"]]) is True
-        assert events[:3] == ["generate", ("caption", "Title", "Summary"), "play"]
+        # generate → play の順、 play 時点で caption state が "Title" に更新済
+        assert events[0] == "generate"
+        assert events[1] == ("play", "Title")
+        state = svc.get_caption_state()
+        assert state["type"] == "news"
+        assert state["title"] == "Title"
+        assert state["summary"] == "Summary"
+        assert state["visible"] is True
     finally:
         await svc.stop_worker()
 
@@ -297,18 +302,23 @@ async def test_start_broadcast_does_not_clear_caption_or_start_auto_filler(monke
 
 
 @pytest.mark.asyncio
-async def test_speak_action_fails_when_caption_update_fails(monkeypatch):
+async def test_speak_caption_state_updated_before_playback(monkeypatch):
+    """caption は OBS API 失敗の概念が無くなった（HTML overlay の in-memory state）。
+    代わりに「再生開始時点で caption state が caption_title/summary に反映済」を保証する。"""
     async def generate_and_save(text, style, speaker_id):
         return "/tmp/test.wav", 0.0
 
-    async def update_caption(title, summary):
-        return False
+    captured = {}
 
     async def play_audio(self, file_path, duration, style):
+        captured["state"] = svc.get_caption_state()
         return True
 
+    async def set_visible_source(emotion):
+        return "ok"
+
     monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
-    monkeypatch.setattr(service_module.obs_adapter, "update_news_caption", update_caption)
+    monkeypatch.setattr(service_module.obs_adapter, "set_visible_source", set_visible_source)
     monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
 
     svc = StreamerBodyService()
@@ -321,35 +331,11 @@ async def test_speak_action_fails_when_caption_update_fails(monkeypatch):
             caption_summary="Summary",
         )
 
-        action_id = result["action_id"]
-        assert await svc.wait_for_queue_strict([action_id]) is False
-        assert svc._task_status[action_id]["status"] == "failed"
-    finally:
-        await svc.stop_worker()
-
-
-@pytest.mark.asyncio
-async def test_wait_for_queue_strict_returns_false_for_speak_caption_failure(monkeypatch):
-    async def generate_and_save(text, style, speaker_id):
-        return "/tmp/test.wav", 0.0
-
-    async def update_caption(title, summary):
-        return False
-
-    monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
-    monkeypatch.setattr(service_module.obs_adapter, "update_news_caption", update_caption)
-
-    svc = StreamerBodyService()
-    await svc.start_worker()
-    try:
-        result = await svc.speak(
-            "本文",
-            style="neutral",
-            caption_title="Title",
-            caption_summary="Summary",
-        )
-
-        assert await svc.wait_for_queue_strict([result["action_id"]]) is False
+        assert await svc.wait_for_queue_strict([result["action_id"]]) is True
+        assert captured["state"]["type"] == "news"
+        assert captured["state"]["title"] == "Title"
+        assert captured["state"]["summary"] == "Summary"
+        assert captured["state"]["visible"] is True
     finally:
         await svc.stop_worker()
 

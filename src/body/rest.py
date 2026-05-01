@@ -263,6 +263,33 @@ class BodyApp:
             logger.error(f"Error in caption/clear API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def caption_state_api(self, request: Request) -> JSONResponse:
+        """現在の caption 状態を返す。 OBS ブラウザソースから 1 秒間隔で fetch される。"""
+        state = self.service.get_caption_state()
+        # OBS ブラウザソース（file:// or http:// 起点）からのアクセス用に CORS を許す
+        return JSONResponse(
+            state,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def caption_set_api(self, request: Request) -> JSONResponse:
+        """caption 状態を任意の type で更新する（intro / news / comment / closing 等）。"""
+        try:
+            body = await request.json()
+            result = await self.service.set_caption(
+                type=body.get("type", ""),
+                title=body.get("title", ""),
+                summary=body.get("summary", ""),
+                visible=body.get("visible", True),
+            )
+            return self._ok_result(result)
+        except Exception as e:
+            logger.error(f"Error in caption/set API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     def get_routes(self) -> list[Route]:
         """共通のルート定義を返します。"""
         return [
@@ -286,4 +313,6 @@ class BodyApp:
             Route("/api/scene/switch", self.scene_switch_api, methods=["POST"]),
             Route("/api/caption/news", self.caption_news_api, methods=["POST"]),
             Route("/api/caption/clear", self.caption_clear_api, methods=["POST"]),
+            Route("/api/caption/state", self.caption_state_api, methods=["GET"]),
+            Route("/api/caption/set", self.caption_set_api, methods=["POST"]),
         ]

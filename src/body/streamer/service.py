@@ -58,6 +58,48 @@ class StreamerBodyService(BodyServiceBase):
         self._auto_filler_task = None
         # idle 中に saint_graph から事前登録された雑談セリフを混ぜる用
         self._chitchat_pool: list[str] = []
+        # OBS ブラウザソースから fetch される現在の caption 状態。
+        # type は "intro" / "news" / "comment" / "closing" / "" (非表示)。
+        self._caption_state: Dict[str, Any] = {
+            "type": "",
+            "title": "",
+            "summary": "",
+            "visible": False,
+            "updated_at": 0.0,
+        }
+
+    async def set_caption(
+        self,
+        type: str = "",
+        title: str = "",
+        summary: str = "",
+        visible: bool = True,
+    ) -> str:
+        """OBS ブラウザソース経由で表示する caption 状態を更新する。
+
+        type:
+          - "intro"  : 配信開始の演出（例: title=「くららのAIニュース解説」）
+          - "news"   : ニュース読み上げ中（title=ニュースタイトル / summary=本文）
+          - "comment": コメント反応中（title=視聴者名 / summary=コメント本文）
+          - "closing": 配信終了の演出（例: title=「おしまい」）
+          - ""       : 非表示
+        """
+        self._caption_state = {
+            "type": type,
+            "title": title,
+            "summary": summary,
+            "visible": visible if type else False,
+            "updated_at": time.time(),
+        }
+        logger.info(
+            f"[caption_state] type={type or '(empty)'} visible={self._caption_state['visible']} "
+            f"title='{title[:40]}'"
+        )
+        return "caption updated"
+
+    def get_caption_state(self) -> Dict[str, Any]:
+        """現在の caption 状態を返す（OBS ブラウザソースのポーリング用）。"""
+        return dict(self._caption_state)
 
     async def inject_comment(self, author: str, message: str) -> str:
         """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
@@ -185,17 +227,18 @@ class StreamerBodyService(BodyServiceBase):
         elif task_type == "filler":
             await self._handle_filler_action(task)
         elif task_type == "caption_news":
-            ok = await obs_adapter.call_with_transient_retry(
-                obs_adapter.update_news_caption,
-                task.get("title", ""),
-                task.get("summary", ""),
+            # 旧来 OBS のテキストソースを書き換えていたが、 caption は HTML overlay
+            # （/api/caption/state を OBS ブラウザソースから fetch）に一本化したため、
+            # 内部 state を更新するだけの no-op に変更。 worker queue 経由を保つことで
+            # speak / scene_switch との順序（D6 caption-speak 同期）は保たれる。
+            await self.set_caption(
+                type="news",
+                title=task.get("title", ""),
+                summary=task.get("summary", ""),
+                visible=True,
             )
-            if not ok:
-                raise RuntimeError("caption_news failed")
         elif task_type == "caption_clear":
-            ok = await obs_adapter.call_with_transient_retry(obs_adapter.clear_news_caption)
-            if not ok:
-                raise RuntimeError("caption_clear failed")
+            await self.set_caption(visible=False)
         elif task_type == "scene_switch":
             ok = await obs_adapter.call_with_transient_retry(
                 obs_adapter.switch_scene,
@@ -242,15 +285,15 @@ class StreamerBodyService(BodyServiceBase):
         # 1. 音声生成（2〜3秒かかる）
         file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
 
-        # 2. caption 付き speak は、音声生成完了後・再生開始直前に更新する。
+        # 2. caption 付き speak は、音声生成完了後・再生開始直前に内部 state を更新する。
+        #    HTML overlay（OBS ブラウザソース）が /api/caption/state をポーリングして表示する。
         if caption_title is not None or caption_summary is not None:
-            ok = await obs_adapter.call_with_transient_retry(
-                obs_adapter.update_news_caption,
-                caption_title or "",
-                caption_summary or "",
+            await self.set_caption(
+                type="news",
+                title=caption_title or "",
+                summary=caption_summary or "",
+                visible=True,
             )
-            if not ok:
-                raise RuntimeError("caption update before speak failed")
 
         # 3. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
         ok = await self.play_audio_with_sync_emotion(file_path, duration, style)

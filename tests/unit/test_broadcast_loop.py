@@ -36,6 +36,7 @@ def _make_ctx(news_service=None, comments=None):
     mock_saint.body.wait_for_queue = AsyncMock()
     mock_saint.body.update_news_caption = AsyncMock()
     mock_saint.body.clear_news_caption = AsyncMock()
+    mock_saint.body.set_caption = AsyncMock()
     mock_saint.body.play_filler = AsyncMock()
     mock_saint.body.play_bgm = AsyncMock()
     mock_saint.body.stop_bgm = AsyncMock()
@@ -231,19 +232,19 @@ async def test_handle_news_skips_comment_when_prefetch_is_ready():
 
 @pytest.mark.asyncio
 async def test_handle_news_with_single_comment_updates_caption_with_author_and_clears_after():
-    """単一コメント picking 時: title=視聴者名 / summary=本文 で caption update、 反応後にクリア。"""
+    """単一コメント picking 時: type=comment / title=視聴者名 / summary=本文のみ → 反応後にクリア。"""
     ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "テストコメントだよ"}])
     await handle_news(ctx)
 
-    ctx.saint_graph.body.update_news_caption.assert_called_once_with(
-        "視聴者A", "視聴者A: テストコメントだよ"
+    ctx.saint_graph.body.set_caption.assert_any_call(
+        type="comment", title="視聴者A", summary="テストコメントだよ"
     )
-    ctx.saint_graph.body.clear_news_caption.assert_called_once()
+    ctx.saint_graph.body.set_caption.assert_any_call(visible=False)
 
 
 @pytest.mark.asyncio
 async def test_handle_news_with_multiple_comments_lists_authors_and_joins_messages():
-    """複数コメント picking 時: title=「先頭名 ほか N 名」 / summary=改行連記。"""
+    """複数コメント picking 時: title=「先頭名 ほか N 名」 / summary=本文のみ改行連記（視聴者名は title 側のみ）。"""
     ctx = _make_ctx(comments=[
         {"author": "視聴者A", "message": "メッセージ1"},
         {"author": "視聴者B", "message": "メッセージ2"},
@@ -251,11 +252,11 @@ async def test_handle_news_with_multiple_comments_lists_authors_and_joins_messag
     ])
     await handle_news(ctx)
 
-    expected_summary = "視聴者A: メッセージ1\n視聴者B: メッセージ2\n視聴者C: メッセージ3"
-    ctx.saint_graph.body.update_news_caption.assert_called_once_with(
-        "視聴者A ほか 2 名", expected_summary
+    expected_summary = "メッセージ1\nメッセージ2\nメッセージ3"
+    ctx.saint_graph.body.set_caption.assert_any_call(
+        type="comment", title="視聴者A ほか 2 名", summary=expected_summary
     )
-    ctx.saint_graph.body.clear_news_caption.assert_called_once()
+    ctx.saint_graph.body.set_caption.assert_any_call(visible=False)
 
 
 @pytest.mark.asyncio
@@ -268,8 +269,10 @@ async def test_handle_news_clears_comment_caption_even_if_process_turn_raises():
     # caption の clear は finally で確実に呼ばれる
     await handle_news(ctx)
 
-    ctx.saint_graph.body.update_news_caption.assert_called_once()
-    ctx.saint_graph.body.clear_news_caption.assert_called_once()
+    # set_caption は最低 2 回呼ばれる: comment 表示 + 反応後クリア
+    set_calls = ctx.saint_graph.body.set_caption.call_args_list
+    assert any(c.kwargs.get("type") == "comment" for c in set_calls)
+    assert any(c.kwargs.get("visible") is False for c in set_calls)
 
 
 @pytest.mark.asyncio

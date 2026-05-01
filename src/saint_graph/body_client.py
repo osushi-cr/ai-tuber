@@ -188,6 +188,27 @@ class BodyClient:
         data = await self.queue_bgm_stop(bgm_id)
         return data.get("result", f"BGM {bgm_id} stopped")
 
+    async def set_caption(
+        self,
+        type: str = "",
+        title: str = "",
+        summary: str = "",
+        visible: bool = True,
+    ) -> str:
+        """OBS ブラウザソース経由で表示する caption を任意の type で更新する。
+
+        type:
+          - "intro" / "news" / "comment" / "closing" / ""（非表示）
+        """
+        data = await self._request(
+            "POST",
+            "/api/caption/set",
+            {"type": type, "title": title, "summary": summary, "visible": visible},
+        )
+        if data:
+            return data.get("result", "caption updated")
+        return "Error: Failed to update caption"
+
     async def play_filler(
         self,
         category: Optional[str] = None,

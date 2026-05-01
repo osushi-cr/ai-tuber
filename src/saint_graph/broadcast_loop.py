@@ -242,16 +242,20 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
         )
 
         # コメント反応セリフ生成・再生中はそのコメントを caption に表示し続ける。
-        # title=最初の視聴者名（複数なら「ほか N 名」付与）、 summary=改行で連記した全件本文。
+        # title=最初の視聴者名（複数なら「ほか N 名」付与）、 summary=本文のみ（連記時は改行）。
         first_author = picked[0].get("author", "User")
         if len(picked) > 1:
             caption_title = f"{first_author} ほか {len(picked) - 1} 名"
+            # 複数 picking 時の summary は本文のみ改行連記（視聴者名の重複表示を避ける）
+            caption_summary = "\n".join(c.get("message", "") for c in picked)
         else:
             caption_title = first_author
-        caption_summary = comments_text
+            caption_summary = picked[0].get("message", "")
         try:
-            await ctx.saint_graph.body.update_news_caption(
-                caption_title, caption_summary
+            await ctx.saint_graph.body.set_caption(
+                type="comment",
+                title=caption_title,
+                summary=caption_summary,
             )
         except Exception as e:
             logger.warning(f"Failed to update comment caption: {e}")
@@ -262,7 +266,7 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
             # 反応完了後は caption をクリア。 次のニュース読み上げに上書きされる
             # 場合もあるが、 QA フェーズなど後続が無い場合の取り残しを防ぐ。
             try:
-                await ctx.saint_graph.body.clear_news_caption()
+                await ctx.saint_graph.body.set_caption(visible=False)
             except Exception as e:
                 logger.warning(f"Failed to clear comment caption: {e}")
 
@@ -311,6 +315,15 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
 
+    # OP 演出の caption（HTML overlay）
+    try:
+        await ctx.saint_graph.body.set_caption(
+            type="intro",
+            title=os.getenv("BROADCAST_INTRO_CAPTION_TITLE", "くららのAIニュース解説"),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to set intro caption: {e}")
+
     # news1 prefetch をバックグラウンドで仕込む（INTRO テキスト取得と並行）
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
@@ -342,6 +355,12 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
         await ctx.saint_graph.body.switch_bgm("op")
     except Exception as e:
         logger.warning(f"Failed to switch INTRO BGM (op): {e}")
+
+    # waiting 中の intro caption はキャラ画面に切り替わったタイミングで畳む
+    try:
+        await ctx.saint_graph.body.set_caption(visible=False)
+    except Exception as e:
+        logger.warning(f"Failed to clear intro caption: {e}")
 
     # 取得済セリフを TTS + 再生 queue に投入。 worker は kurara_main 切替後に
     # この speak action を処理するため、 kurara_main 画面で挨拶が始まる。
@@ -516,6 +535,15 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
         await ctx.saint_graph.body.queue_auto_filler_stop()
     except Exception as e:
         logger.warning(f"Failed to queue auto_filler_stop at CLOSING: {e}")
+
+    # ED 演出の caption（HTML overlay）。 ending シーンに残したまま 60s Holding する。
+    try:
+        await ctx.saint_graph.body.set_caption(
+            type="closing",
+            title=os.getenv("BROADCAST_CLOSING_CAPTION_TITLE", "おしまい"),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to set closing caption: {e}")
 
     closings_dir = Path(os.getenv("CLOSING_POOL_DIR", "data/mind/kurara/closings"))
     candidates = (
