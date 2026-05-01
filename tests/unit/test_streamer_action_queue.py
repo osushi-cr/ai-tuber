@@ -216,6 +216,65 @@ async def test_wait_for_queue_strict_detects_failed_action(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wait_for_queue_strict_returns_when_target_completes_even_while_other_actions_keep_queueing(
+    monkeypatch, tmp_path
+):
+    """回帰テスト: auto_filler が並走して queue に action を投入し続けている状況でも、
+    wait_for_queue_strict(action_ids=...) は指定 action だけが completed になれば即 return する。
+
+    バグ再現: 修正前の実装は冒頭で `_action_queue.join()` を呼ぶため、 auto_filler が
+    queue に常時投入していると queue は空にならず永久ハング。 結果 saint_graph 側の
+    process_turn が完了せず handle_intro 末尾の kurara_main 切替に到達しない。
+    """
+    filler_file = tmp_path / "filler_aizuchi_001.wav"
+    _write_empty_wav(filler_file)
+    monkeypatch.setattr(service_module, "FILLER_VOICE_DIR", tmp_path)
+
+    async def play_audio(self, file_path, duration, style):
+        await asyncio.sleep(0.01)
+        return True
+
+    async def update_caption(title, summary):
+        return True
+
+    monkeypatch.setattr(service_module.obs_adapter, "update_news_caption", update_caption)
+    monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
+
+    svc = StreamerBodyService()
+    await svc.start_worker()
+
+    keep_filling = True
+
+    async def background_filler():
+        # queue に絶えず filler を入れ続けて _action_queue.join() を解かせない
+        while keep_filling:
+            await svc.play_filler("aizuchi")
+            await asyncio.sleep(0.02)
+
+    bg_task = asyncio.create_task(background_filler())
+    try:
+        # 監視対象の caption action を投入
+        result = await svc.update_news_caption("Title", "Summary")
+        target_id = result["action_id"]
+
+        # 修正前: queue が空にならず asyncio.wait_for が timeout
+        # 修正後: target_id が completed になり次第 True を返す
+        ok = await asyncio.wait_for(
+            svc.wait_for_queue_strict([target_id]),
+            timeout=3.0,
+        )
+        assert ok is True
+    finally:
+        keep_filling = False
+        bg_task.cancel()
+        try:
+            await bg_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await svc.stop_worker()
+
+
+@pytest.mark.asyncio
 async def test_start_broadcast_does_not_clear_caption_or_start_auto_filler(monkeypatch):
     async def start_obs_recording(self):
         return "OBS録画を開始しました。"

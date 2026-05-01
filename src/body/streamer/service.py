@@ -561,15 +561,50 @@ class StreamerBodyService(BodyServiceBase):
         self,
         action_ids: Optional[list[str]] = None,
         recent_count: Optional[int] = None,
+        poll_interval: float = 0.1,
+        timeout: Optional[float] = None,
     ) -> bool:
-        """キュー消化後、指定 action がすべて completed か検査する。"""
+        """指定 action がすべて completed か検査する。
+
+        action_ids 指定時は対象 action_id だけを polling で監視するため、
+        auto_filler 等の並行タスクが queue に常時投入していても、 対象 action の
+        完了（または failed）を検知できる。
+
+        action_ids 未指定時は従来通り queue が空になるまで join() で待ち、
+        直近 recent_count 件のステータスを検査する。
+        """
+        if action_ids is not None:
+            logger.info(
+                f"Waiting for {len(action_ids)} action(s) to complete (strict, polling)..."
+            )
+            deadline = (time.monotonic() + timeout) if timeout is not None else None
+            while True:
+                statuses = [self._task_status.get(aid) for aid in action_ids]
+                # いずれかが failed → 即 False
+                for aid, status in zip(action_ids, statuses):
+                    if status is not None and status.get("status") == "failed":
+                        logger.warning(
+                            f"wait_for_queue_strict: action_id={aid} status=failed"
+                        )
+                        return False
+                # すべて completed → True
+                if all(
+                    status is not None and status.get("status") == "completed"
+                    for status in statuses
+                ):
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    logger.warning(
+                        f"wait_for_queue_strict: timeout after {timeout}s"
+                    )
+                    return False
+                await asyncio.sleep(poll_interval)
+
+        # action_ids 未指定: 既存挙動（queue 空待ち→直近 recent_count を検査）
         logger.info("Waiting for action queue to be empty (strict)...")
         await self._action_queue.join()
-        target_ids = action_ids
-        if target_ids is None:
-            limit = recent_count or WAIT_STRICT_RECENT_LIMIT
-            target_ids = list(self._task_status.keys())[-limit:]
-
+        limit = recent_count or WAIT_STRICT_RECENT_LIMIT
+        target_ids = list(self._task_status.keys())[-limit:]
         for action_id in target_ids:
             status = self._task_status.get(action_id)
             if status is None:
