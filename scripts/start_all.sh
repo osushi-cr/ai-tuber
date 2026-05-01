@@ -35,7 +35,7 @@ fi
 echo "[2/3] run_server.py (MioCodec) :8001"
 if start_if_idle 8001 "run_server.py"; then
     cd "${MIOTTS_INFERENCE_DIR}"
-    nohup uv run python run_server.py \
+    nohup env PYTHONUNBUFFERED=1 uv run python run_server.py \
         --llm-base-url http://localhost:8002/v1 --device cpu \
         > "${LOG_DIR}/run-server.log" 2>&1 &
     echo "  → started PID=$!"
@@ -44,7 +44,7 @@ fi
 echo "[3/3] body-streamer (uvicorn) :8000"
 if start_if_idle 8000 "body-streamer"; then
     cd "${AI_TUBER_DIR}"
-    nohup env PYTHONPATH=src .venv/bin/python \
+    nohup env PYTHONUNBUFFERED=1 PYTHONPATH=src .venv/bin/python \
         -m uvicorn body.streamer.main:app --port 8000 \
         > "${LOG_DIR}/body-streamer.log" 2>&1 &
     echo "  → started PID=$!"
