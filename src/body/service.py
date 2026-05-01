@@ -42,6 +42,21 @@ class BodyServiceBase(ABC):
         ...
 
     @abstractmethod
+    async def stop_broadcast(self) -> str:
+        """録画または配信を停止します。"""
+        ...
+
+    @abstractmethod
+    async def start_auto_filler(self) -> Any:
+        """auto-filler ループ開始を presentation queue に投入します。"""
+        ...
+
+    @abstractmethod
+    async def stop_auto_filler(self) -> Any:
+        """auto-filler ループ停止を presentation queue に投入します。"""
+        ...
+
+    @abstractmethod
     async def wait_for_queue(self) -> str:
         """すべての処理が完了するまで待機します。"""
         ...

@@ -1,5 +1,7 @@
+import asyncio
 import wave
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -86,6 +88,38 @@ async def test_presentation_actions_are_processed_in_queue_order(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_auto_filler_start_and_stop_are_queue_actions(monkeypatch):
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def fake_auto_filler_loop():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    svc = StreamerBodyService()
+    svc._broadcasting = True
+    monkeypatch.setattr(svc, "_auto_filler_loop", fake_auto_filler_loop)
+
+    await svc.start_worker()
+    try:
+        start = await svc.start_auto_filler()
+        assert await svc.wait_for_queue_strict([start["action_id"]]) is True
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        assert svc._auto_filler_task is not None
+
+        stop = await svc.stop_auto_filler()
+        assert await svc.wait_for_queue_strict([stop["action_id"]]) is True
+        await asyncio.wait_for(stopped.wait(), timeout=1.0)
+        assert svc._auto_filler_task is None
+    finally:
+        svc._broadcasting = False
+        await svc.stop_worker()
+
+
+@pytest.mark.asyncio
 async def test_speak_caption_is_updated_after_generation_before_playback(monkeypatch):
     events = []
 
@@ -127,6 +161,44 @@ async def test_speak_caption_is_updated_after_generation_before_playback(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_speak_does_not_switch_scene_or_start_auto_filler(monkeypatch):
+    events = []
+
+    async def generate_and_save(text, style, speaker_id):
+        return "/tmp/test.wav", 0.0
+
+    async def switch_scene(scene):
+        events.append(("scene_switch", scene))
+        return True
+
+    async def play_audio(self, file_path, duration, style):
+        events.append("play")
+        return True
+
+    async def set_visible_source(emotion):
+        return "ok"
+
+    monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
+    monkeypatch.setattr(service_module.obs_adapter, "switch_scene", switch_scene)
+    monkeypatch.setattr(service_module.obs_adapter, "set_visible_source", set_visible_source)
+    monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
+
+    svc = StreamerBodyService()
+    svc._broadcasting = True
+    await svc.start_worker()
+    try:
+        result = await svc.speak("本文", style="neutral")
+
+        assert await svc.wait_for_queue_strict([result["action_id"]]) is True
+        assert events == ["play"]
+        assert svc._auto_filler_task is None
+        assert not hasattr(svc, "_first_speech_done")
+    finally:
+        svc._broadcasting = False
+        await svc.stop_worker()
+
+
+@pytest.mark.asyncio
 async def test_wait_for_queue_strict_detects_failed_action(monkeypatch):
     async def switch_scene(scene):
         return False
@@ -141,6 +213,28 @@ async def test_wait_for_queue_strict_detects_failed_action(monkeypatch):
         assert await svc.wait_for_queue_strict([result["action_id"]]) is False
     finally:
         await svc.stop_worker()
+
+
+@pytest.mark.asyncio
+async def test_start_broadcast_does_not_clear_caption_or_start_auto_filler(monkeypatch):
+    async def start_obs_recording(self):
+        return "OBS録画を開始しました。"
+
+    async def clear_news_caption():
+        raise AssertionError("start_broadcast must not clear captions")
+
+    monkeypatch.setenv("STREAMING_MODE", "false")
+    monkeypatch.setattr(StreamerBodyService, "start_obs_recording", start_obs_recording)
+    monkeypatch.setattr(service_module.asyncio, "sleep", AsyncMock())
+
+    svc = StreamerBodyService()
+    monkeypatch.setattr(svc, "clear_news_caption", clear_news_caption)
+
+    result = await svc.start_broadcast()
+
+    assert result == "OBS録画を開始しました。"
+    assert svc._broadcasting is True
+    assert svc._auto_filler_task is None
 
 
 @pytest.mark.asyncio

@@ -192,6 +192,24 @@ class BodyApp:
             logger.error(f"Error in filler/play API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def auto_filler_start_api(self, request: Request) -> JSONResponse:
+        """auto-filler ループ開始を presentation queue に投入する。"""
+        try:
+            result = await self.service.start_auto_filler()
+            return self._ok_result(result)
+        except Exception as e:
+            logger.error(f"Error in auto_filler/start API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    async def auto_filler_stop_api(self, request: Request) -> JSONResponse:
+        """auto-filler ループ停止を presentation queue に投入する。"""
+        try:
+            result = await self.service.stop_auto_filler()
+            return self._ok_result(result)
+        except Exception as e:
+            logger.error(f"Error in auto_filler/stop API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     async def chitchat_register_api(self, request: Request) -> JSONResponse:
         """雑談セリフのリストを登録し、auto-filler ループに混ぜる。"""
         try:
@@ -256,6 +274,8 @@ class BodyApp:
             Route("/api/bgm/play", self.bgm_play_api, methods=["POST"]),
             Route("/api/bgm/stop", self.bgm_stop_api, methods=["POST"]),
             Route("/api/filler/play", self.filler_play_api, methods=["POST"]),
+            Route("/api/auto_filler/start", self.auto_filler_start_api, methods=["POST"]),
+            Route("/api/auto_filler/stop", self.auto_filler_stop_api, methods=["POST"]),
             Route("/api/chitchat/register", self.chitchat_register_api, methods=["POST"]),
             Route("/api/scene/switch", self.scene_switch_api, methods=["POST"]),
             Route("/api/caption/news", self.caption_news_api, methods=["POST"]),

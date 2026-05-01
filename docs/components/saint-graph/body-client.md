@@ -96,6 +96,7 @@ await body_client.stop_broadcast()
 ```
 
 - **概要**: 録画と配信を統合したエンドポイントです。環境変数 `STREAMING_MODE` に基づき、Body 側で自動的に OBS 録画か YouTube Live 配信かを判定します。
+- **責任範囲**: `start_broadcast` は OBS 録画 / YouTube Live 配信開始と stream active 待機のみを行います。caption clear・scene 切替・auto-filler 起動は broadcast loop が presentation queue に投入します。
 - **補足**: `stop_broadcast` は、キュー内のすべての発話が完了するのを待機してから停止処理を行いますが、呼び出し側でも必要に応じて `wait_for_queue` を使用できます。
 
 ### wait_for_queue(timeout=300.0)
@@ -132,8 +133,10 @@ ok = await body_client.wait_for_queue_strict([res["action_id"]])
 | `queue_bgm_switch(bgm_id)` | ループ系 BGM 切替 |
 | `queue_bgm_play(bgm_id, restart=True)` | BGM / SE 再生 |
 | `queue_bgm_stop(bgm_id)` | BGM / SE 停止 |
+| `queue_auto_filler_start()` | auto-filler ループ開始 |
+| `queue_auto_filler_stop()` | auto-filler ループ停止 |
 
-既存の `update_news_caption()` / `clear_news_caption()` / `switch_scene()` / `switch_bgm()` / `play_bgm()` / `stop_bgm()` も同じ endpoint を呼びますが、戻り値は従来通り表示用文字列です。action_id が必要な場合は `queue_*` メソッドを使います。
+既存の `update_news_caption()` / `clear_news_caption()` / `switch_scene()` / `switch_bgm()` / `play_bgm()` / `stop_bgm()` / `start_auto_filler()` / `stop_auto_filler()` も同じ endpoint を呼びますが、戻り値は従来通り表示用文字列です。action_id が必要な場合は `queue_*` メソッドを使います。
 
 ---
 

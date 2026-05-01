@@ -34,6 +34,7 @@ class BroadcastContext:
     # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
     next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
     closing_reason: Optional[str] = None
+    phase_scene_initialized: set[BroadcastPhase] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +116,68 @@ async def _queue_news_entry_presentation(ctx: BroadcastContext) -> Optional[str]
         logger.warning("NEWS presentation setup did not return action_id")
         return None
     return action_id
+
+
+async def _queue_and_wait_strict(ctx: BroadcastContext, queue_call, label: str) -> bool:
+    """単一 presentation action を投入し、strict 成功を 1 回 retry 付きで確認する。"""
+    for attempt in range(2):
+        try:
+            response = await queue_call()
+            action_id = _extract_action_id(response)
+            if not action_id:
+                logger.warning(f"{label} did not return action_id")
+                await ctx.saint_graph.body.wait_for_queue()
+                ok = False
+            else:
+                ok = await ctx.saint_graph.body.wait_for_queue_strict([action_id])
+
+            if ok:
+                return True
+            if attempt == 0:
+                logger.warning(f"{label} failed on attempt 1; retrying once")
+            else:
+                logger.warning(f"{label} failed on attempt 2")
+        except Exception as e:
+            logger.warning(f"{label} error on attempt {attempt + 1}: {e}")
+
+    return False
+
+
+async def _queue_and_wait_strict_once(ctx: BroadcastContext, queue_call, label: str) -> bool:
+    """補助 presentation action を投入し、strict 成功を retry なしで確認する。"""
+    try:
+        response = await queue_call()
+        action_id = _extract_action_id(response)
+        if not action_id:
+            logger.warning(f"{label} did not return action_id")
+            await ctx.saint_graph.body.wait_for_queue()
+            return False
+
+        ok = await ctx.saint_graph.body.wait_for_queue_strict([action_id])
+        if not ok:
+            logger.warning(f"{label} failed")
+        return ok
+    except Exception as e:
+        logger.warning(f"{label} error: {e}")
+        return False
+
+
+async def _queue_scene_switch_strict(
+    ctx: BroadcastContext, scene_name: str, label: str
+) -> bool:
+    return await _queue_and_wait_strict(
+        ctx,
+        lambda: ctx.saint_graph.body.queue_scene_switch(scene_name),
+        label,
+    )
+
+
+async def _queue_caption_clear_strict(ctx: BroadcastContext) -> bool:
+    return await _queue_and_wait_strict(
+        ctx,
+        ctx.saint_graph.body.queue_caption_clear,
+        "broadcast startup caption_clear",
+    )
 
 
 async def _play_news_sentences_with_retry(
@@ -202,6 +265,13 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     news1 のセリフ生成だけを先取りする。
     生成済 task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
     """
+    waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
+    await _queue_scene_switch_strict(
+        ctx,
+        waiting_scene,
+        "INTRO start waiting_scene",
+    )
+
     intro_task = asyncio.create_task(ctx.saint_graph.process_intro())
 
     if ctx.news_service.has_next():
@@ -216,19 +286,15 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 
     await intro_task
 
-    # NEWS フェーズへ入る前に kurara_main シーン切替を確定させる。
-    # 通常は worker の初回 speak ハンドラが intro 開始時点で切替済みだが、
-    # intro が短文 / Gemini 失敗で speak が走らなかった場合や、シーン切替の
-    # 反映遅延で handle_news の update_news_caption が waiting 残存中に
-    # 走るタイミングを防ぐ保険。既に kurara_main なら no-op で済む。
-    try:
-        main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-        await ctx.saint_graph.body.switch_scene(main_scene)
-        # OBS の SetCurrentProgramScene 受領後、シーン上のソース更新が
-        # 反映されるまでの短い遅延を吸収する。
-        await asyncio.sleep(float(os.getenv("MAIN_SCENE_SETTLE_SECONDS", "0.3")))
-    except Exception as e:
-        logger.warning(f"Failed to ensure main scene before NEWS: {e}")
+    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+    ok = await _queue_scene_switch_strict(
+        ctx,
+        main_scene,
+        "INTRO end scene_switch",
+    )
+    if not ok:
+        ctx.closing_reason = "technical_failure"
+        return BroadcastPhase.CLOSING
 
     return BroadcastPhase.NEWS
 
@@ -324,6 +390,18 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
     `_QA_PROMPT_EVERY` サイクル毎に「コメント募集」促進セリフを発する。
     沈黙が `MAX_WAIT_CYCLES` 続いたら CLOSING へ遷移する。
     """
+    if BroadcastPhase.QA not in ctx.phase_scene_initialized:
+        main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+        ok = await _queue_scene_switch_strict(
+            ctx,
+            main_scene,
+            "QA entry scene_switch",
+        )
+        if not ok:
+            ctx.closing_reason = "technical_failure"
+            return BroadcastPhase.CLOSING
+        ctx.phase_scene_initialized.add(BroadcastPhase.QA)
+
     if await _poll_and_respond(ctx):
         ctx.idle_counter = 0
         return BroadcastPhase.QA
@@ -354,11 +432,12 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     await ctx.saint_graph.body.wait_for_queue()
 
     # 配信終了画面へシーン切替（ending イラスト＋BGM）
-    try:
-        ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")
-        await ctx.saint_graph.body.switch_scene(ending_scene)
-    except Exception as e:
-        logger.warning(f"Failed to switch to ending scene: {e}")
+    ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")
+    await _queue_and_wait_strict_once(
+        ctx,
+        lambda: ctx.saint_graph.body.queue_scene_switch(ending_scene),
+        "CLOSING ending scene_switch",
+    )
 
     return None  # ループ終了のシグナル
 
@@ -435,13 +514,23 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     phase = BroadcastPhase.INTRO
     logger.info("Entering Broadcast Loop (state machine)...")
 
-    # 雑談セリフを body-streamer に登録（auto-filler が idle 時に混ぜる）
-    await ctx.saint_graph.register_chitchat()
-
-    # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
-    await _switch_bgm_for_phase(ctx, phase, with_se=False)
-
     try:
+        if not await _queue_caption_clear_strict(ctx):
+            ctx.closing_reason = "technical_failure"
+            phase = BroadcastPhase.CLOSING
+        else:
+            # 雑談セリフを body-streamer に登録（auto-filler が idle 時に混ぜる）
+            await ctx.saint_graph.register_chitchat()
+
+            await _queue_and_wait_strict_once(
+                ctx,
+                ctx.saint_graph.body.queue_auto_filler_start,
+                "broadcast startup auto_filler_start",
+            )
+
+            # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
+            await _switch_bgm_for_phase(ctx, phase, with_se=False)
+
         while phase is not None:
             try:
                 handler = _HANDLERS[phase]
@@ -466,4 +555,9 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
                 logger.critical(f"Critical System Error in phase {phase.value}: {e}", exc_info=True)
                 raise
     finally:
+        await _queue_and_wait_strict_once(
+            ctx,
+            ctx.saint_graph.body.queue_auto_filler_stop,
+            "broadcast shutdown auto_filler_stop",
+        )
         await _cancel_pending_tasks(ctx)

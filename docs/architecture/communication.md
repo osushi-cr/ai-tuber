@@ -107,6 +107,8 @@ Saint Graph がコメント反応用に buffer を drain する場合は `POST /
 | `POST /api/bgm/play` | BGM / SE 再生 | `{"bgm_id": "se", "restart": true}` |
 | `POST /api/bgm/stop` | BGM / SE 停止 | `{"bgm_id": "se"}` |
 | `POST /api/filler/play` | filler wav 再生 | `{"category": "aizuchi", "style": "neutral"}` |
+| `POST /api/auto_filler/start` | auto-filler ループ開始 | `{}` |
+| `POST /api/auto_filler/stop` | auto-filler ループ停止 | `{}` |
 
 ### 5. POST /api/queue/wait
 
@@ -135,6 +137,7 @@ presentation queue の消化を待った後、指定 action がすべて `comple
 ### 7. POST /api/broadcast/start
 
 配信または録画を開始します。Body サービスが `STREAMING_MODE` 環境変数に基づいて、YouTube Live 配信か OBS 録画かを自動判定します。
+この endpoint は broadcast lifecycle 専用で、caption clear・scene 切替・auto-filler 起動は行いません。配信演出の初期化は Saint Graph の broadcast loop が presentation queue 経由で明示的に投入します。
 
 **Request Body** (オプション):
 ```json
@@ -223,7 +226,7 @@ result = await agent.run("東京の明日の天気を教えて")
 | 機能 | 通信方式 | 起動トリガー | 理由 |
 |---|---|---|---|
 | **発話・感情変更** | REST | **プログラム（Parser）** | エラーを許容せず、常に確実に実行するため |
-| **caption / scene / BGM / filler** | REST → presentation queue | **プログラム（Loop）** | 視聴者向けの時系列を worker で一元管理するため |
+| **caption / scene / BGM / filler / auto-filler 起動停止** | REST → presentation queue | **プログラム（Loop）** | 視聴者向けの時系列を worker で一元管理するため |
 | **コメント取得** | REST | **プログラム（Loop）** | 定期的なポーリングが必要なため |
 | **録画・配信制御** | REST | **プログラム（Setup/Teardown）** | システムの開始・終了と同期させるため |
 | **天気予報取得** | MCP | **AI（Autonomous）** | 必要かどうかを AI が判断し、動的に拡張したいため |

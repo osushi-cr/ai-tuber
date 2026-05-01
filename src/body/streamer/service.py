@@ -58,8 +58,6 @@ class StreamerBodyService(BodyServiceBase):
         self._auto_filler_task = None
         # idle 中に saint_graph から事前登録された雑談セリフを混ぜる用
         self._chitchat_pool: list[str] = []
-        # 初回 speak で waiting → kurara_main へ切替＋auto-filler 起動するため
-        self._first_speech_done = False
 
     async def inject_comment(self, author: str, message: str) -> str:
         """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
@@ -227,6 +225,10 @@ class StreamerBodyService(BodyServiceBase):
             )
             if not ok:
                 raise RuntimeError(f"bgm_stop failed: {task.get('bgm_id')}")
+        elif task_type == "auto_filler_start":
+            await self._start_auto_filler_task()
+        elif task_type == "auto_filler_stop":
+            await self._stop_auto_filler_task()
         else:
             raise RuntimeError(f"unknown action type: {task_type}")
 
@@ -240,22 +242,7 @@ class StreamerBodyService(BodyServiceBase):
         # 1. 音声生成（2〜3秒かかる）
         file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
 
-        # 2. 【初回 speak 時に waiting → kurara_main 切替 ＋ auto-filler 起動】
-        if self._broadcasting and not self._first_speech_done:
-            self._first_speech_done = True
-            try:
-                await obs_adapter.call_with_transient_retry(
-                    obs_adapter.switch_scene,
-                    os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to switch to main scene on first speech: {e}")
-            self._last_audio_end_time = time.time()
-            if self._auto_filler_task is None or self._auto_filler_task.done():
-                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
-                logger.info("Auto-filler loop started on first speech")
-
-        # 3. caption 付き speak は、音声生成完了後・再生開始直前に更新する。
+        # 2. caption 付き speak は、音声生成完了後・再生開始直前に更新する。
         if caption_title is not None or caption_summary is not None:
             ok = await obs_adapter.call_with_transient_retry(
                 obs_adapter.update_news_caption,
@@ -265,12 +252,12 @@ class StreamerBodyService(BodyServiceBase):
             if not ok:
                 raise RuntimeError("caption update before speak failed")
 
-        # 4. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
+        # 3. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
         ok = await self.play_audio_with_sync_emotion(file_path, duration, style)
         if not ok:
             raise RuntimeError("audio playback failed")
 
-        # 5. 音声再生終了後、即座に口を閉じる
+        # 4. 音声再生終了後、即座に口を閉じる
         await obs_adapter.set_visible_source("silent")
 
         logger.info(f"[Worker:speak] Completed: {text[:30]}...")
@@ -389,6 +376,22 @@ class StreamerBodyService(BodyServiceBase):
             "News caption clear queued",
         )
 
+    async def start_auto_filler(self) -> Dict[str, Any]:
+        """auto-filler ループ開始を presentation queue に投入する。"""
+        return await self._enqueue_action(
+            "auto_filler_start",
+            {},
+            "Auto-filler start queued",
+        )
+
+    async def stop_auto_filler(self) -> Dict[str, Any]:
+        """auto-filler ループ停止を presentation queue に投入する。"""
+        return await self._enqueue_action(
+            "auto_filler_stop",
+            {},
+            "Auto-filler stop queued",
+        )
+
     async def peek_comments(self) -> str:
         """OBS overlay 表示用にコメントを peek する（buffer を破壊しない）。
 
@@ -437,22 +440,9 @@ class StreamerBodyService(BodyServiceBase):
         return json.dumps(comments, ensure_ascii=False)
 
     async def start_broadcast(self, config: Optional[Dict[str, Any]] = None) -> str:
-        """配信または録画を即時開始します。
-
-        OBS は呼び出し時のシーン（通常 waiting）のまま視聴者へ配信される。
-        最初の speak が来た時点で kurara_main シーンへ自動切替し auto-filler が起動する。
-        """
+        """配信または録画を即時開始します。"""
         config = config or {}
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
-
-        # 前回配信時のニュースキャプションが残らないよう、配信開始時に必ず初期化する。
-        try:
-            clear_result = await self.clear_news_caption()
-            ok = await self.wait_for_queue_strict([clear_result["action_id"]])
-            if not ok:
-                logger.warning("Failed to clear news caption at broadcast start")
-        except Exception as e:
-            logger.warning(f"Failed to clear news caption at broadcast start: {e}")
 
         try:
             if streaming_mode:
@@ -465,7 +455,6 @@ class StreamerBodyService(BodyServiceBase):
                 await asyncio.sleep(2)
 
             self._broadcasting = True
-            self._first_speech_done = False
             logger.info("[start_broadcast] Broadcast started. Streaming the current scene (typically 'waiting').")
             return result
         except Exception as e:
@@ -509,6 +498,25 @@ class StreamerBodyService(BodyServiceBase):
                     logger.warning(f"Auto-filler failed ({cat}): {e}")
             i += 1
         logger.info("Auto-filler loop exited")
+
+    async def _start_auto_filler_task(self) -> None:
+        self._last_audio_end_time = time.time()
+        if self._auto_filler_task is None or self._auto_filler_task.done():
+            self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
+            logger.info("Auto-filler loop started")
+
+    async def _stop_auto_filler_task(self) -> None:
+        task = self._auto_filler_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._auto_filler_task = None
+        logger.info("Auto-filler loop stopped")
 
     async def register_chitchat_lines(self, lines: list) -> str:
         """saint_graph 等から雑談セリフのリストを登録し、auto-filler に混ぜる。"""

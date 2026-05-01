@@ -197,6 +197,24 @@ class BodyClient:
             return data.get("result", f"Filler {category} queued")
         return f"Error: Failed to play filler {category}"
 
+    async def queue_auto_filler_start(self) -> Dict[str, Any]:
+        """auto-filler 開始 action を presentation queue に投入する。"""
+        return await self._queue_request("/api/auto_filler/start", {})
+
+    async def start_auto_filler(self) -> str:
+        """auto-filler ループ開始を queue に投入する。"""
+        data = await self.queue_auto_filler_start()
+        return data.get("result", "Auto-filler start queued")
+
+    async def queue_auto_filler_stop(self) -> Dict[str, Any]:
+        """auto-filler 停止 action を presentation queue に投入する。"""
+        return await self._queue_request("/api/auto_filler/stop", {})
+
+    async def stop_auto_filler(self) -> str:
+        """auto-filler ループ停止を queue に投入する。"""
+        data = await self.queue_auto_filler_stop()
+        return data.get("result", "Auto-filler stop queued")
+
     async def register_chitchat_lines(self, lines: List[str]) -> str:
         """雑談セリフリストを body-streamer に登録し、auto-filler に混ぜる。"""
         data = await self._request("POST", "/api/chitchat/register", {"lines": lines})

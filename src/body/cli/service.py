@@ -58,6 +58,14 @@ class CLIBodyService(BodyServiceBase):
         logger.info("[CLI] stop_broadcast called (no-op in CLI mode)")
         return "CLI mode: broadcast stop skipped"
 
+    async def start_auto_filler(self) -> Dict[str, Any]:
+        """CLI モードでは auto-filler 開始を no-op として queue 成功扱いにする。"""
+        return {"message": "CLI mode: auto-filler start skipped", "action_id": str(uuid4())}
+
+    async def stop_auto_filler(self) -> Dict[str, Any]:
+        """CLI モードでは auto-filler 停止を no-op として queue 成功扱いにする。"""
+        return {"message": "CLI mode: auto-filler stop skipped", "action_id": str(uuid4())}
+
     async def wait_for_queue(self) -> str:
         """何もしません (CLI版)"""
         return "CLI mode: no queue to wait"
