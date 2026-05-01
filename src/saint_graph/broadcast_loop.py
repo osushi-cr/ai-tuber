@@ -238,7 +238,32 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
         logger.info(
             f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
         )
-        await ctx.saint_graph.process_turn(comments_text)
+
+        # コメント反応セリフ生成・再生中はそのコメントを caption に表示し続ける。
+        # title=最初の視聴者名（複数なら「ほか N 名」付与）、 summary=改行で連記した全件本文。
+        first_author = picked[0].get("author", "User")
+        if len(picked) > 1:
+            caption_title = f"{first_author} ほか {len(picked) - 1} 名"
+        else:
+            caption_title = first_author
+        caption_summary = comments_text
+        try:
+            await ctx.saint_graph.body.update_news_caption(
+                caption_title, caption_summary
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update comment caption: {e}")
+
+        try:
+            await ctx.saint_graph.process_turn(comments_text)
+        finally:
+            # 反応完了後は caption をクリア。 次のニュース読み上げに上書きされる
+            # 場合もあるが、 QA フェーズなど後続が無い場合の取り残しを防ぐ。
+            try:
+                await ctx.saint_graph.body.clear_news_caption()
+            except Exception as e:
+                logger.warning(f"Failed to clear comment caption: {e}")
+
         return True
     except Exception as e:
         logger.error(f"Error in polling/turn: {e}", exc_info=True)

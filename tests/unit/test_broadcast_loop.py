@@ -103,13 +103,56 @@ async def test_handle_intro_prefetches_first_news_text_only():
 async def test_handle_news_with_comment():
     ctx = _make_ctx(comments=[{"author": "User", "message": "Hi?"}])
     phase = await handle_news(ctx)
-    
+
     assert phase == BroadcastPhase.NEWS
     # コメント応答は process_turn を直接呼ぶ（共通ユーティリティ）
     ctx.saint_graph.process_turn.assert_called_once()
     assert "User: Hi" in ctx.saint_graph.process_turn.call_args[0][0]
     ctx.saint_graph.process_news_reading.assert_not_called()
     ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_news_with_single_comment_updates_caption_with_author_and_clears_after():
+    """単一コメント picking 時: title=視聴者名 / summary=本文 で caption update、 反応後にクリア。"""
+    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "テストコメントだよ"}])
+    await handle_news(ctx)
+
+    ctx.saint_graph.body.update_news_caption.assert_called_once_with(
+        "視聴者A", "視聴者A: テストコメントだよ"
+    )
+    ctx.saint_graph.body.clear_news_caption.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_news_with_multiple_comments_lists_authors_and_joins_messages():
+    """複数コメント picking 時: title=「先頭名 ほか N 名」 / summary=改行連記。"""
+    ctx = _make_ctx(comments=[
+        {"author": "視聴者A", "message": "メッセージ1"},
+        {"author": "視聴者B", "message": "メッセージ2"},
+        {"author": "視聴者C", "message": "メッセージ3"},
+    ])
+    await handle_news(ctx)
+
+    expected_summary = "視聴者A: メッセージ1\n視聴者B: メッセージ2\n視聴者C: メッセージ3"
+    ctx.saint_graph.body.update_news_caption.assert_called_once_with(
+        "視聴者A ほか 2 名", expected_summary
+    )
+    ctx.saint_graph.body.clear_news_caption.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_news_clears_comment_caption_even_if_process_turn_raises():
+    """process_turn で例外が出ても caption は確実にクリアされる。"""
+    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "テストコメント"}])
+    ctx.saint_graph.process_turn.side_effect = RuntimeError("Gemini failure")
+
+    # _poll_and_respond は内部で例外を握りつぶす（False を返す）が、
+    # caption の clear は finally で確実に呼ばれる
+    await handle_news(ctx)
+
+    ctx.saint_graph.body.update_news_caption.assert_called_once()
+    ctx.saint_graph.body.clear_news_caption.assert_called_once()
 
 
 @pytest.mark.asyncio
