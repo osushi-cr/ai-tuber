@@ -282,18 +282,20 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     演出順序:
         1. waiting シーン切替 (best-effort) ＋ chitchat BGM
         2. news1 prefetch をバックグラウンドで開始
-        3. waiting 中に process_intro(wait_after=False) で Gemini→TTS→speak queue
-           投入まで完了させる。 再生完了はまだ待たない
+        3. waiting 中に prepare_intro_text() で Gemini からテキストだけ取得
+           （TTS / 発話キュー投入はまだしない）
         4. kurara_main シーン strict 切替
         5. op (intro) BGM へ切替
-        6. 投入済 INTRO speech の再生完了を strict 待ち（kurara_main 切替直後に
-           音声が始まり、 完了まで保つ）
+        6. play_prepared_sentences() で TTS + 再生を speak queue へ投入し、
+           completed まで strict 待ち
         7. auto_filler 起動（NEWS 以降の沈黙埋め用）
         8. NEWS フェーズへ
 
+    Gemini 応答取得（重い）は waiting 中に済ませ、 TTS + 再生は kurara_main 切替後の
+    キューに乗せる。 worker キューは順次処理なので「scene 切替 → 挨拶 TTS → 再生」
+    の順序が確実に保たれ、 視聴者には kurara_main で挨拶が始まるように見える。
+
     auto_filler は INTRO 完了後に起動するため、 INTRO 中に chitchat が割り込まない。
-    INTRO speech wav は waiting 中に裏で生成しておくため kurara_main 切替直後に
-    なめらかに挨拶が始まる。
     """
     # waiting scene は配信開始前演出のための補助 scene で、 失敗しても fatal ではない。
     waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
@@ -309,7 +311,7 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
 
-    # news1 prefetch をバックグラウンドで仕込む（INTRO 生成と並行）
+    # news1 prefetch をバックグラウンドで仕込む（INTRO テキスト取得と並行）
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
         if first_item:
@@ -320,9 +322,9 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
                 )
             )
 
-    # waiting 中に INTRO speech を Gemini で生成し speak queue まで投入する。
-    # 再生完了は kurara_main 切替後に同期する。
-    intro_action_ids = await ctx.saint_graph.process_intro(wait_after=False)
+    # waiting 中に Gemini で挨拶テキストを取得（TTS と発話キュー投入はしない）。
+    # ここが重い処理（Gemini API + retry）なので chitchat BGM で見せる。
+    intro_sentences = await ctx.saint_graph.prepare_intro_text()
 
     # kurara_main へ strict 切替（挨拶はキャラ画面で流す）
     main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
@@ -341,9 +343,16 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch INTRO BGM (op): {e}")
 
-    # 投入済 INTRO speech の再生完了を待つ（kurara_main 上で再生される）
-    if intro_action_ids:
-        await ctx.saint_graph.body.wait_for_queue_strict(action_ids=intro_action_ids)
+    # 取得済セリフを TTS + 再生 queue に投入。 worker は kurara_main 切替後に
+    # この speak action を処理するため、 kurara_main 画面で挨拶が始まる。
+    if intro_sentences:
+        intro_action_ids = await ctx.saint_graph.play_prepared_sentences(
+            intro_sentences, wait_after=False
+        )
+        if intro_action_ids:
+            await ctx.saint_graph.body.wait_for_queue_strict(
+                action_ids=intro_action_ids
+            )
 
     # auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込みを避ける）。
     # NEWS / QA フェーズの沈黙埋めはここから先で動く。

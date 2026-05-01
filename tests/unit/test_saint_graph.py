@@ -158,7 +158,7 @@ async def test_play_prepared_sentences_speaks_and_waits(mock_adk):
     sg.body.wait_for_queue_strict = AsyncMock(return_value=True)
 
     # Execute
-    action_id = await sg.play_prepared_sentences([("joyful", "Hello"), ("sad", "Bye")])
+    action_ids = await sg.play_prepared_sentences([("joyful", "Hello"), ("sad", "Bye")])
 
     # Verify
     from unittest.mock import call
@@ -177,7 +177,7 @@ async def test_play_prepared_sentences_speaks_and_waits(mock_adk):
         action_ids=["speak-1", "speak-2"]
     )
     sg.body.wait_for_queue.assert_not_called()
-    assert action_id == "speak-1"
+    assert action_ids == ["speak-1", "speak-2"]
 
 
 @pytest.mark.asyncio
@@ -219,13 +219,13 @@ async def test_play_prepared_sentences_can_skip_wait(mock_adk):
     sg.body.wait_for_queue = AsyncMock()
 
     # Execute
-    action_id = await sg.play_prepared_sentences([("neutral", "Hello")], wait_after=False)
+    action_ids = await sg.play_prepared_sentences([("neutral", "Hello")], wait_after=False)
 
     # Verify
     sg.body.change_emotion.assert_called_once_with("neutral")
     sg.body.queue_speak.assert_called_once_with("Hello", style="neutral", speaker_id=None)
     sg.body.wait_for_queue.assert_not_called()
-    assert action_id == "speak-1"
+    assert action_ids == ["speak-1"]
 
 
 @pytest.mark.asyncio

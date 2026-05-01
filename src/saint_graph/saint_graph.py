@@ -78,15 +78,27 @@ class SaintGraph:
                 await ts.close()
 
     async def process_intro(self, wait_after: bool = True):
-        """開始挨拶を実行します。
-
-        wait_after=False のとき、 Gemini 応答→TTS→speak キュー投入まで完了したら
-        speak action_ids を返して即時 return する。 投入したセリフの再生完了は
-        呼び出し側で `body.wait_for_queue_strict(action_ids=...)` で同期する。
-        waiting シーン中に生成して kurara_main 切替後に再生開始したいときに使う。
-        """
+        """開始挨拶を実行します。"""
         template = self.templates.get("intro", "こんにちは。配信を始めます。")
         return await self.process_turn(template, context="Intro", wait_after=wait_after)
+
+    async def prepare_intro_text(self) -> List[Tuple[str, str]]:
+        """挨拶セリフだけを Gemini で生成し、 発話キューには投入しません。
+
+        prepare_news_reading_text と同じく独立 session で叩いてメイン yt_session
+        への文脈混入を避ける。 戻り値の sentences を play_prepared_sentences に
+        渡すと TTS と再生が start するため、 シーン切替後に音声開始するための
+        分離が可能になる。
+        """
+        template = self.templates.get("intro", "こんにちは。配信を始めます。")
+        self._prefetch_seq += 1
+        prefetch_session_id = f"yt_intro_prefetch_{self._prefetch_seq}"
+        return await self._collect_turn_sentences(
+            template,
+            context="Intro",
+            session_id=prefetch_session_id,
+            user_id="yt_intro_prefetch_user",
+        )
 
     async def prepare_news_reading_text(self, title: str, content: str) -> List[Tuple[str, str]]:
         """ニュース読み上げ用のセリフだけを生成し、発話キューには投入しません。
@@ -112,10 +124,9 @@ class SaintGraph:
         self,
         sentences: List[Tuple[str, str]],
         wait_after: bool = True,
-    ) -> Optional[str]:
-        """生成済みセリフを Body の発話キューへ投入します。"""
-        action_ids = await self._play_sentences(sentences, wait_after=wait_after)
-        return action_ids[0] if action_ids else None
+    ) -> List[str]:
+        """生成済みセリフを Body の発話キューへ投入し、 投入した speak action_ids を返す。"""
+        return await self._play_sentences(sentences, wait_after=wait_after)
 
     async def play_prepared_sentences_with_caption(
         self,
