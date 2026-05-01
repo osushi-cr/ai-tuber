@@ -102,6 +102,14 @@ _COMMON_ABBREVS = [
     ("SaaS", "サース"),
     ("PaaS", "パース"),
     ("IaaS", "イアース"),
+    # 2026-05 配信検証で観察したブランド・固有名詞（Gemini が誤カタカナ化していた語の正読み）
+    ("Mythos", "ミュトス"),
+    ("Yubico", "ユビコ"),
+    ("Stripe", "ストライプ"),
+    ("Grok", "グロック"),
+    ("xAI", "エックスエーアイ"),
+    # Gemini が間違えて出してきたカタカナ表記の保険補正（左辺が英字でなくても string.replace でマッチする）
+    ("マイソス", "ミュトス"),
 ]
 _COMMON_ABBREVS_SORTED = sorted(_COMMON_ABBREVS, key=lambda x: -len(x[0]))
 
