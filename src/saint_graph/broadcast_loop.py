@@ -279,9 +279,17 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
 async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。
 
-    intro→news1 間の沈黙を最小化するため、intro セリフ生成・再生と並行して
-    news1 のセリフ生成だけを先取りする。
-    生成済 task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
+    演出順序:
+        1. waiting シーン切替 (best-effort) ＋ chitchat BGM
+        2. news1 prefetch をバックグラウンドで開始
+        3. kurara_main シーン strict 切替
+        4. op (intro) BGM へ切替
+        5. process_intro() で挨拶セリフを生成・再生
+        6. NEWS フェーズへ
+
+    挨拶セリフは waiting 画面ではなく **kurara_main 画面**で流れる。
+    prefetch は INTRO speech 生成・再生と並行するため news1 開始までの沈黙を最小化。
+    生成済 prefetch task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
     """
     # waiting scene は配信開始前演出のための補助 scene で、 失敗しても fatal ではない。
     # retry は走らせず、 strict 確認も 1 回（best-effort）に留める。
@@ -292,8 +300,13 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
         "INTRO start waiting_scene",
     )
 
-    intro_task = asyncio.create_task(ctx.saint_graph.process_intro())
+    # waiting 中の BGM。 失敗しても致命ではない。
+    try:
+        await ctx.saint_graph.body.switch_bgm("chitchat")
+    except Exception as e:
+        logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
 
+    # INTRO speech と並行して news1 prefetch を仕込む（沈黙最小化のため）
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
         if first_item:
@@ -304,8 +317,7 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
                 )
             )
 
-    await intro_task
-
+    # kurara_main へ strict 切替（INTRO speech はキャラ画面で流す）
     main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
     ok = await _queue_scene_switch_strict(
         ctx,
@@ -315,6 +327,14 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     if not ok:
         ctx.closing_reason = "technical_failure"
         return BroadcastPhase.CLOSING
+
+    # kurara_main に切替えてから op BGM、 そして挨拶セリフ
+    try:
+        await ctx.saint_graph.body.switch_bgm("op")
+    except Exception as e:
+        logger.warning(f"Failed to switch INTRO BGM (op): {e}")
+
+    await ctx.saint_graph.process_intro()
 
     return BroadcastPhase.NEWS
 
@@ -487,6 +507,14 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
         "CLOSING ending scene_switch",
     )
 
+    # ending BGM (ed) を一定時間流して余韻を残してから配信終了。
+    # CLOSING フェーズ突入時に _switch_bgm_for_phase で既に "ed" が再生されているので、
+    # ここでは指定秒数だけ画面を保持するだけで良い。
+    ending_duration = float(os.getenv("BROADCAST_ENDING_DURATION", "60"))
+    if ending_duration > 0:
+        logger.info(f"Holding ending scene with BGM for {ending_duration}s before exit")
+        await asyncio.sleep(ending_duration)
+
     return None  # ループ終了のシグナル
 
 
@@ -503,7 +531,9 @@ _HANDLERS = {
 
 # フェーズと BGM の対応。 obs_adapter.BGM_SOURCES の bgm_id と一致させる。
 _PHASE_BGM = {
-    BroadcastPhase.INTRO:   "op",
+    # INTRO は handle_intro 内で waiting=chitchat → kurara_main=op を動的切替するため None。
+    # run_broadcast_loop 冒頭の自動 BGM 切替はスキップさせる。
+    BroadcastPhase.INTRO:   None,
     BroadcastPhase.NEWS:    "news",
     BroadcastPhase.QA:      "chitchat",
     BroadcastPhase.CLOSING: "ed",

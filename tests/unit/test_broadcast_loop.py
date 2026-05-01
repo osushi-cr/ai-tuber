@@ -59,7 +59,7 @@ async def test_handle_intro():
     news_service.has_next.return_value = False
     ctx = _make_ctx(news_service=news_service)
     phase = await handle_intro(ctx)
-    
+
     assert phase == BroadcastPhase.NEWS
     ctx.saint_graph.process_intro.assert_called_once()
     ctx.saint_graph.prepare_news_reading_text.assert_not_called()
@@ -71,6 +71,46 @@ async def test_handle_intro():
         call(["scene-action"]),
         call(["scene-action"]),
     ])
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_switches_bgm_chitchat_then_op():
+    """waiting で chitchat BGM、 kurara_main 切替後に op BGM を流す。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+
+    await handle_intro(ctx)
+
+    ctx.saint_graph.body.switch_bgm.assert_has_calls([
+        call("chitchat"),
+        call("op"),
+    ])
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_speech_runs_after_kurara_main_switch():
+    """挨拶セリフは kurara_main 切替の後で発話される（waiting 中ではない）。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    call_order: list[str] = []
+
+    ctx = _make_ctx(news_service=news_service)
+
+    async def record_scene(scene):
+        call_order.append(f"scene:{scene}")
+        return {"action_id": "scene-action"}
+
+    async def record_intro():
+        call_order.append("process_intro")
+
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=record_scene)
+    ctx.saint_graph.process_intro = AsyncMock(side_effect=record_intro)
+
+    await handle_intro(ctx)
+
+    # waiting → kurara_main → process_intro の順
+    assert call_order == ["scene:waiting", "scene:kurara_main", "process_intro"]
 
 
 @pytest.mark.asyncio
@@ -501,12 +541,13 @@ async def test_handle_qa_closes_when_main_scene_strict_fails():
 
 
 @pytest.mark.asyncio
-async def test_handle_closing():
+async def test_handle_closing(monkeypatch):
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
     ctx = _make_ctx()
     # asyncio.sleep をモックしてテストを高速化
     with patch("asyncio.sleep", return_value=None):
         phase = await handle_closing(ctx)
-    
+
     assert phase is None
     ctx.saint_graph.process_closing.assert_called_once_with(reason=None)
     ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("ending")
@@ -514,7 +555,8 @@ async def test_handle_closing():
 
 
 @pytest.mark.asyncio
-async def test_handle_closing_passes_technical_failure_reason():
+async def test_handle_closing_passes_technical_failure_reason(monkeypatch):
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
     ctx = _make_ctx()
     ctx.closing_reason = "technical_failure"
     with patch("asyncio.sleep", return_value=None):
@@ -522,6 +564,43 @@ async def test_handle_closing_passes_technical_failure_reason():
 
     assert phase is None
     ctx.saint_graph.process_closing.assert_called_once_with(reason="technical_failure")
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_holds_ending_scene_for_configured_duration(monkeypatch):
+    """ending シーン切替後に BROADCAST_ENDING_DURATION 秒だけ asyncio.sleep する。"""
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "45")
+    ctx = _make_ctx()
+
+    sleep_calls: list[float] = []
+
+    async def record_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    with patch("asyncio.sleep", side_effect=record_sleep):
+        await handle_closing(ctx)
+
+    # ending 切替後の 45 秒 sleep が呼ばれる（他にも内部 sleep があれば混じる）
+    assert 45.0 in sleep_calls
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_skips_sleep_when_duration_is_zero(monkeypatch):
+    """BROADCAST_ENDING_DURATION=0 で待機をスキップする。"""
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
+    ctx = _make_ctx()
+
+    sleep_calls: list[float] = []
+
+    async def record_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    with patch("asyncio.sleep", side_effect=record_sleep):
+        await handle_closing(ctx)
+
+    # 60 秒や 45 秒のような ending 用待機は走らない
+    assert 60.0 not in sleep_calls
+    assert 45.0 not in sleep_calls
 
 
 @pytest.mark.asyncio
@@ -539,6 +618,7 @@ async def test_handle_closing_uses_closing_pool_when_available(monkeypatch, tmp_
             w.setframerate(16000)
             w.writeframes(b"")
     monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
 
     ctx = _make_ctx()
     ctx.saint_graph.body.queue_filler = AsyncMock(
@@ -569,6 +649,7 @@ async def test_handle_closing_falls_back_to_gemini_when_pool_empty(monkeypatch, 
     pool_dir = tmp_path / "closings"
     pool_dir.mkdir()
     monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
 
     ctx = _make_ctx()
     with patch("asyncio.sleep", return_value=None):
@@ -579,7 +660,8 @@ async def test_handle_closing_falls_back_to_gemini_when_pool_empty(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog):
+async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog, monkeypatch):
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
     caplog.set_level("WARNING", logger="saint-graph")
     ctx = _make_ctx()
     ctx.saint_graph.body.queue_scene_switch.return_value = {"action_id": "ending"}
