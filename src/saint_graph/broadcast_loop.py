@@ -367,20 +367,21 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 
 async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     """
-    NEWS: コメント優先で確認し、なければニュースを 1 本読み上げる。
+    NEWS: ニュースをテンポ良く読み上げる。 コメント反応は **次ニュースの
+    prefetch が完了していないとき限定** で時間稼ぎとして挟む。
 
     プリフェッチ最適化:
     - 現ニュースのセリフは ctx.next_news_task に既に生成されているはず（無ければ即時生成）
     - 現ニュース再生開始前に「次のニュース」のセリフ生成 task をキック
     - 再生完了と caption/音声の成否を wait_for_queue_strict で確認 → 次ループへ
 
+    コメント反応の挟み込み方針:
+    - 次ニュースの prefetch task が完了していれば → コメント拾いをスキップして即ニュース
+    - 次ニュースの prefetch task が進行中なら → 待ち時間にコメントを返す（時間稼ぎ）
+    - ニュース全消化後は QA フェーズに遷移してコメント反応コーナーへ
+
     ニュースを全消化したら QA へ遷移する。
     """
-    # コメント優先
-    if await _poll_and_respond(ctx):
-        ctx.idle_counter = 0
-        return BroadcastPhase.NEWS
-
     # ニュース全消化 → QA（コメント拾いコーナー）へ
     if not ctx.news_service.has_next():
         logger.info("All news items read. Moving to QA (comment corner).")
@@ -390,6 +391,16 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
             logger.warning(f"Failed to clear news caption: {e}")
         await ctx.saint_graph.process_news_finished()
         return BroadcastPhase.QA
+
+    # 次ニュースの prefetch が終わっていなければ、 待ち時間にコメント反応で繋ぐ。
+    # done() なら即ニュース読み上げに進む（コメントは QA フェーズで拾う）。
+    next_ready = (
+        ctx.next_news_task is not None and ctx.next_news_task.done()
+    )
+    if not next_ready:
+        if await _poll_and_respond(ctx):
+            ctx.idle_counter = 0
+            return BroadcastPhase.NEWS
 
     item = ctx.news_service.peek_current_item()
     if not item:

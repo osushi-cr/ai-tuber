@@ -186,7 +186,10 @@ async def test_handle_intro_prefetches_first_news_text_only():
 
 @pytest.mark.asyncio
 async def test_handle_news_with_comment():
+    """次ニュース prefetch が未完了時は、 コメントが来てたら反応 turn で時間稼ぎする。"""
     ctx = _make_ctx(comments=[{"author": "User", "message": "Hi?"}])
+    # next_news_task が None なら next_ready=False → コメント反応経路
+    assert ctx.next_news_task is None
     phase = await handle_news(ctx)
 
     assert phase == BroadcastPhase.NEWS
@@ -195,6 +198,35 @@ async def test_handle_news_with_comment():
     assert "User: Hi" in ctx.saint_graph.process_turn.call_args[0][0]
     ctx.saint_graph.process_news_reading.assert_not_called()
     ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_news_skips_comment_when_prefetch_is_ready():
+    """次ニュースの prefetch task が done なら、 コメント拾いをスキップして即ニュース読み上げに進む。"""
+    news_service = MagicMock()
+    news_service.has_next.side_effect = [True, False]
+    item = MagicMock()
+    item.title = "Title"
+    item.content = "Content"
+    news_service.peek_current_item.return_value = item
+    news_service.get_next_item.return_value = item
+
+    ctx = _make_ctx(news_service=news_service, comments=[
+        {"author": "User", "message": "気になる！"},
+    ])
+
+    # prefetch task を「即完了する future」として用意（done=True）
+    ready_future: asyncio.Future = asyncio.Future()
+    ready_future.set_result([("neutral", "本文")])
+    ctx.next_news_task = ready_future
+
+    phase = await handle_news(ctx)
+
+    assert phase == BroadcastPhase.NEWS
+    # コメント来てたが prefetch ready のため反応 turn は走らない
+    ctx.saint_graph.process_turn.assert_not_called()
+    # 直接ニュース読み上げに進む
+    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once()
 
 
 @pytest.mark.asyncio
