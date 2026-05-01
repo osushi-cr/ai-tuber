@@ -275,7 +275,9 @@ async def test_high_level_process_methods(mock_adk):
 
     # Execute & Verify process_intro
     await sg.process_intro()
-    sg.process_turn.assert_called_with("Welcome to my stream", context="Intro")
+    sg.process_turn.assert_called_with(
+        "Welcome to my stream", context="Intro", wait_after=True
+    )
 
     # Execute & Verify process_news_reading
     await sg.process_news_reading("MyTopic", "MyContent")

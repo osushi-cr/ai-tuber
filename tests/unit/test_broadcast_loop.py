@@ -20,7 +20,9 @@ def _make_ctx(news_service=None, comments=None):
     mock_saint = MagicMock()
     # 新しいメソッドの AsyncMock 化
     mock_saint.process_turn = AsyncMock()
-    mock_saint.process_intro = AsyncMock()
+    # process_intro は wait_after=False で呼ばれ speak action_ids を返す。
+    # 既定では空リスト＝ INTRO speech 待ちはスキップされる。
+    mock_saint.process_intro = AsyncMock(return_value=[])
     mock_saint.process_news_reading = AsyncMock()
     mock_saint.prepare_news_reading_text = AsyncMock(return_value=[("neutral", "本文")])
     mock_saint.play_prepared_sentences = AsyncMock()
@@ -89,8 +91,9 @@ async def test_handle_intro_switches_bgm_chitchat_then_op():
 
 
 @pytest.mark.asyncio
-async def test_handle_intro_speech_runs_after_kurara_main_switch():
-    """挨拶セリフは kurara_main 切替の後で発話される（waiting 中ではない）。"""
+async def test_handle_intro_generates_speech_in_waiting_then_plays_in_kurara_main():
+    """waiting 中に process_intro(wait_after=False) で speak queue 投入し、
+    kurara_main 切替後に wait_for_queue_strict で再生完了を待つ流れ。"""
     news_service = MagicMock()
     news_service.has_next.return_value = False
     call_order: list[str] = []
@@ -101,16 +104,51 @@ async def test_handle_intro_speech_runs_after_kurara_main_switch():
         call_order.append(f"scene:{scene}")
         return {"action_id": "scene-action"}
 
-    async def record_intro():
-        call_order.append("process_intro")
+    async def record_intro(wait_after=True):
+        call_order.append(f"process_intro:wait_after={wait_after}")
+        return ["intro-speak-action"]
+
+    async def record_strict(action_ids=None, **kwargs):
+        if action_ids == ["intro-speak-action"]:
+            call_order.append("wait_intro_speech")
+        return True
+
+    async def record_filler_start():
+        call_order.append("auto_filler_start")
+        return {"action_id": "auto-start"}
 
     ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=record_scene)
     ctx.saint_graph.process_intro = AsyncMock(side_effect=record_intro)
+    ctx.saint_graph.body.wait_for_queue_strict = AsyncMock(side_effect=record_strict)
+    ctx.saint_graph.body.queue_auto_filler_start = AsyncMock(side_effect=record_filler_start)
 
     await handle_intro(ctx)
 
-    # waiting → kurara_main → process_intro の順
-    assert call_order == ["scene:waiting", "scene:kurara_main", "process_intro"]
+    # waiting → process_intro(False) → kurara_main → INTRO 再生待ち → auto_filler 起動 の順
+    assert call_order == [
+        "scene:waiting",
+        "process_intro:wait_after=False",
+        "scene:kurara_main",
+        "wait_intro_speech",
+        "auto_filler_start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_starts_auto_filler_after_intro_speech():
+    """auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込み防止）。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+    ctx.saint_graph.process_intro = AsyncMock(return_value=["intro-action"])
+
+    await handle_intro(ctx)
+
+    ctx.saint_graph.process_intro.assert_called_once_with(wait_after=False)
+    ctx.saint_graph.body.queue_auto_filler_start.assert_called_once()
+    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(
+        action_ids=["intro-action"]
+    )
 
 
 @pytest.mark.asyncio
@@ -338,7 +376,8 @@ async def test_handle_intro_continues_when_waiting_scene_fails_once(caplog):
         {"action_id": "waiting-1"},
         {"action_id": "main"},
     ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, True]
+    # waiting strict 失敗、 main strict 成功、 auto_filler_start strict 成功
+    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, True, True]
 
     phase = await handle_intro(ctx)
 
@@ -350,9 +389,12 @@ async def test_handle_intro_continues_when_waiting_scene_fails_once(caplog):
         call("waiting"),
         call("kurara_main"),
     ])
+    # waiting strict と main strict が呼ばれる（INTRO speech は process_intro 戻り値が
+    # 空リストなのでスキップ、 auto_filler_start は最後に呼ばれる）
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
         call(["waiting-1"]),
         call(["main"]),
+        call(["auto-start"]),
     ])
 
 
@@ -373,8 +415,11 @@ async def test_handle_intro_continues_when_waiting_scene_has_no_action_id():
     assert phase == BroadcastPhase.NEWS
     # action_id 欠落時のフォールバックとして wait_for_queue が呼ばれる
     ctx.saint_graph.body.wait_for_queue.assert_called_once()
-    # main 切替の strict は実行される
-    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with(["main"])
+    # main strict と auto_filler_start strict は実行される
+    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
+        call(["main"]),
+        call(["auto-start"]),
+    ])
 
 
 @pytest.mark.asyncio
@@ -677,6 +722,9 @@ async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog, m
 
 @pytest.mark.asyncio
 async def test_run_broadcast_loop_moves_startup_presentation_to_loop():
+    """run_broadcast_loop 冒頭で caption_clear と register_chitchat、
+    終了時に auto_filler_stop が呼ばれる。
+    auto_filler_start は handle_intro 内に移動したのでここでは呼ばれない。"""
     ctx = _make_ctx()
 
     async def finish_immediately(_ctx):
@@ -688,63 +736,44 @@ async def test_run_broadcast_loop_moves_startup_presentation_to_loop():
     ctx.saint_graph.body.queue_caption_clear.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(["caption-clear"])
     ctx.saint_graph.register_chitchat.assert_called_once()
-    ctx.saint_graph.body.queue_auto_filler_start.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(["auto-start"])
+    # auto_filler_start は handle_intro 内に移動したため、 ハンドラを stub した
+    # このテストでは呼ばれない
+    ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
+    # 終了時の auto_filler_stop は引き続き finally で呼ばれる
     ctx.saint_graph.body.queue_auto_filler_stop.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(["auto-stop"])
 
 
 @pytest.mark.asyncio
-async def test_run_broadcast_loop_warns_and_continues_when_auto_filler_start_fails(caplog):
+async def test_handle_intro_warns_and_continues_when_auto_filler_start_fails(caplog):
+    """auto_filler_start が strict 失敗しても handle_intro は NEWS フェーズへ進む。"""
     caplog.set_level("WARNING", logger="saint-graph")
-    ctx = _make_ctx()
-    handled = False
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [
-        True,   # startup caption clear
-        False,  # auto-filler start
-        True,   # auto-filler stop
-    ]
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+    # waiting strict, main strict, auto_filler_start strict
+    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [True, True, False]
 
-    async def finish_immediately(_ctx):
-        nonlocal handled
-        handled = True
-        return None
+    phase = await handle_intro(ctx)
 
-    with patch("saint_graph.broadcast_loop._HANDLERS", {BroadcastPhase.INTRO: finish_immediately}):
-        await run_broadcast_loop(ctx)
-
-    assert handled is True
+    assert phase == BroadcastPhase.NEWS
     ctx.saint_graph.body.queue_auto_filler_start.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["caption-clear"]),
-        call(["auto-start"]),
-        call(["auto-stop"]),
-    ])
-    assert "broadcast startup auto_filler_start failed" in caplog.text
+    assert "INTRO end auto_filler_start failed" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_run_broadcast_loop_continues_when_auto_filler_start_has_no_action_id(caplog):
+async def test_handle_intro_continues_when_auto_filler_start_has_no_action_id(caplog):
+    """auto_filler_start の queue 投入で action_id が返らなくても handle_intro は継続。"""
     caplog.set_level("WARNING", logger="saint-graph")
-    ctx = _make_ctx()
-    handled = False
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
     ctx.saint_graph.body.queue_auto_filler_start.return_value = {"status": "error"}
 
-    async def finish_immediately(_ctx):
-        nonlocal handled
-        handled = True
-        return None
+    phase = await handle_intro(ctx)
 
-    with patch("saint_graph.broadcast_loop._HANDLERS", {BroadcastPhase.INTRO: finish_immediately}):
-        await run_broadcast_loop(ctx)
-
-    assert handled is True
-    assert "broadcast startup auto_filler_start did not return action_id" in caplog.text
-    ctx.saint_graph.body.wait_for_queue.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["caption-clear"]),
-        call(["auto-stop"]),
-    ])
+    assert phase == BroadcastPhase.NEWS
+    assert "INTRO end auto_filler_start did not return action_id" in caplog.text
 
 
 @pytest.mark.asyncio

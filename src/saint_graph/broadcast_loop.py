@@ -282,17 +282,20 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     演出順序:
         1. waiting シーン切替 (best-effort) ＋ chitchat BGM
         2. news1 prefetch をバックグラウンドで開始
-        3. kurara_main シーン strict 切替
-        4. op (intro) BGM へ切替
-        5. process_intro() で挨拶セリフを生成・再生
-        6. NEWS フェーズへ
+        3. waiting 中に process_intro(wait_after=False) で Gemini→TTS→speak queue
+           投入まで完了させる。 再生完了はまだ待たない
+        4. kurara_main シーン strict 切替
+        5. op (intro) BGM へ切替
+        6. 投入済 INTRO speech の再生完了を strict 待ち（kurara_main 切替直後に
+           音声が始まり、 完了まで保つ）
+        7. auto_filler 起動（NEWS 以降の沈黙埋め用）
+        8. NEWS フェーズへ
 
-    挨拶セリフは waiting 画面ではなく **kurara_main 画面**で流れる。
-    prefetch は INTRO speech 生成・再生と並行するため news1 開始までの沈黙を最小化。
-    生成済 prefetch task は ctx.next_news_task に乗せて handle_news に引き継ぐ。
+    auto_filler は INTRO 完了後に起動するため、 INTRO 中に chitchat が割り込まない。
+    INTRO speech wav は waiting 中に裏で生成しておくため kurara_main 切替直後に
+    なめらかに挨拶が始まる。
     """
     # waiting scene は配信開始前演出のための補助 scene で、 失敗しても fatal ではない。
-    # retry は走らせず、 strict 確認も 1 回（best-effort）に留める。
     waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
     await _queue_and_wait_strict_once(
         ctx,
@@ -306,7 +309,7 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
 
-    # INTRO speech と並行して news1 prefetch を仕込む（沈黙最小化のため）
+    # news1 prefetch をバックグラウンドで仕込む（INTRO 生成と並行）
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
         if first_item:
@@ -317,7 +320,11 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
                 )
             )
 
-    # kurara_main へ strict 切替（INTRO speech はキャラ画面で流す）
+    # waiting 中に INTRO speech を Gemini で生成し speak queue まで投入する。
+    # 再生完了は kurara_main 切替後に同期する。
+    intro_action_ids = await ctx.saint_graph.process_intro(wait_after=False)
+
+    # kurara_main へ strict 切替（挨拶はキャラ画面で流す）
     main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
     ok = await _queue_scene_switch_strict(
         ctx,
@@ -328,13 +335,23 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
         ctx.closing_reason = "technical_failure"
         return BroadcastPhase.CLOSING
 
-    # kurara_main に切替えてから op BGM、 そして挨拶セリフ
+    # kurara_main に切替えてから op BGM
     try:
         await ctx.saint_graph.body.switch_bgm("op")
     except Exception as e:
         logger.warning(f"Failed to switch INTRO BGM (op): {e}")
 
-    await ctx.saint_graph.process_intro()
+    # 投入済 INTRO speech の再生完了を待つ（kurara_main 上で再生される）
+    if intro_action_ids:
+        await ctx.saint_graph.body.wait_for_queue_strict(action_ids=intro_action_ids)
+
+    # auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込みを避ける）。
+    # NEWS / QA フェーズの沈黙埋めはここから先で動く。
+    await _queue_and_wait_strict_once(
+        ctx,
+        ctx.saint_graph.body.queue_auto_filler_start,
+        "INTRO end auto_filler_start",
+    )
 
     return BroadcastPhase.NEWS
 
@@ -597,17 +614,15 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
             ctx.closing_reason = "technical_failure"
             phase = BroadcastPhase.CLOSING
         else:
-            # 雑談セリフを body-streamer に登録（auto-filler が idle 時に混ぜる）
+            # 雑談セリフを body-streamer に登録（auto-filler が idle 時に混ぜる）。
+            # auto_filler 自体の起動は handle_intro 末尾まで遅延させて
+            # INTRO 挨拶への chitchat 割り込みを防ぐ。
             await ctx.saint_graph.register_chitchat()
 
-            await _queue_and_wait_strict_once(
-                ctx,
-                ctx.saint_graph.body.queue_auto_filler_start,
-                "broadcast startup auto_filler_start",
-            )
-
-            # 配信開始時に最初のフェーズ（INTRO）の BGM を流す（SEなしでスタート）
-            await _switch_bgm_for_phase(ctx, phase, with_se=False)
+            # 配信開始時の最初のフェーズ（INTRO）BGM は handle_intro 内で
+            # waiting=chitchat → kurara_main=op の順に動的切替する。 ここでは
+            # _switch_bgm_for_phase を呼ばない（_PHASE_BGM[INTRO] が None のため
+            # no-op だが、 意図を明確にする）。
 
         while phase is not None:
             try:

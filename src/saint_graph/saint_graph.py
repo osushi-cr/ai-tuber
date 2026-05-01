@@ -77,10 +77,16 @@ class SaintGraph:
             if isinstance(ts, McpToolset) and hasattr(ts, 'close'):
                 await ts.close()
 
-    async def process_intro(self):
-        """開始挨拶を実行します。"""
+    async def process_intro(self, wait_after: bool = True):
+        """開始挨拶を実行します。
+
+        wait_after=False のとき、 Gemini 応答→TTS→speak キュー投入まで完了したら
+        speak action_ids を返して即時 return する。 投入したセリフの再生完了は
+        呼び出し側で `body.wait_for_queue_strict(action_ids=...)` で同期する。
+        waiting シーン中に生成して kurara_main 切替後に再生開始したいときに使う。
+        """
         template = self.templates.get("intro", "こんにちは。配信を始めます。")
-        await self.process_turn(template, context="Intro")
+        return await self.process_turn(template, context="Intro", wait_after=wait_after)
 
     async def prepare_news_reading_text(self, title: str, content: str) -> List[Tuple[str, str]]:
         """ニュース読み上げ用のセリフだけを生成し、発話キューには投入しません。
