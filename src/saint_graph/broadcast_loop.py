@@ -628,31 +628,18 @@ _PHASE_BGM = {
     BroadcastPhase.CLOSING: "ed",
 }
 
-# 切替 SE が鳴り終わるまで次の BGM 切替を遅らせる秒数。
-# SE と次のBGMが同時再生にならないよう、bgm_se_transition の長さに合わせる。
-_SE_HOLD_SECONDS = float(os.getenv("BROADCAST_SE_HOLD_SECONDS", "2.0"))
-
-
 async def _switch_bgm_for_phase(
     ctx: BroadcastContext, phase: BroadcastPhase, *, with_se: bool = False
 ) -> None:
-    """フェーズに対応する BGM へ切替する。失敗してもループは継続させる。
+    """フェーズに対応する BGM へクロスフェードで切替する。失敗してもループは継続させる。
 
-    `with_se=True` の場合はシーン切替 SE を先に鳴らしてから BGM を切り替える。
-    通常はフェーズ遷移時のみ True、配信開始の最初の INTRO 投入時は False で呼ぶ。
+    BGM 自体が `obs_adapter.switch_bgm` 内で BGM_FADE_DURATION 秒のクロスフェード
+    （旧 BGM フェードアウト ＋ 新 BGM フェードイン並行）を行うため、 シーン切替 SE は
+    挟まない。 互換のため `with_se` 引数は残しているが無視する。
     """
     bgm_id = _PHASE_BGM.get(phase)
     if not bgm_id:
         return
-    if with_se:
-        try:
-            await ctx.saint_graph.body.play_bgm("se")
-            # SE が鳴り終わるまで次の BGM 切替を遅らせる（同時再生回避）
-            await asyncio.sleep(_SE_HOLD_SECONDS)
-            # switch_bgm は SE を停止しない（設計上）ため、明示的に SE を止める
-            await ctx.saint_graph.body.stop_bgm("se")
-        except Exception as e:
-            logger.warning(f"Failed to play transition SE: {e}")
     try:
         await ctx.saint_graph.body.switch_bgm(bgm_id)
     except Exception as e:

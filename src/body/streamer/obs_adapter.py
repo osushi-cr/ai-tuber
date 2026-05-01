@@ -464,8 +464,37 @@ async def stop_bgm(bgm_id: str) -> bool:
     return ok
 
 
+_BGM_FADE_DURATION = float(os.getenv("BGM_FADE_DURATION", "1.5"))
+_BGM_FADE_STEPS = max(1, int(os.getenv("BGM_FADE_STEPS", "15")))
+
+
+def _set_input_volume_sync(source: str, mul: float) -> None:
+    """OBS Input の音量倍率を同期で設定する（mul は 0.0-1.0）。"""
+    try:
+        ws_client.call(obs_requests.SetInputVolume(inputName=source, inputVolumeMul=max(0.0, min(1.0, mul))))
+    except Exception as e:
+        logger.warning(f"Failed to set volume for {source}: {e}")
+
+
+async def _fade_volume(source: str, start: float, end: float, duration: float) -> None:
+    """指定ソースの音量を start から end まで duration 秒かけて変化させる。"""
+    if duration <= 0:
+        _set_input_volume_sync(source, end)
+        return
+    steps = _BGM_FADE_STEPS
+    interval = duration / steps
+    for i in range(1, steps + 1):
+        v = start + (end - start) * (i / steps)
+        _set_input_volume_sync(source, v)
+        await asyncio.sleep(interval)
+
+
 async def switch_bgm(to_id: str) -> bool:
-    """指定BGMを再生し、他のループ系BGM（op/ed/chitchat/news）を停止する。SEは触らない。"""
+    """指定BGMにクロスフェードで切替。 旧 BGM をフェードアウトしながら新 BGM をフェードイン。 SEは触らない。
+
+    フェード時間は環境変数 `BGM_FADE_DURATION`（既定 1.5 秒）、 ステップ数は
+    `BGM_FADE_STEPS`（既定 15 = 100ms 間隔）。
+    """
     target = BGM_SOURCES.get(to_id)
     if target is None:
         logger.warning(f"Unknown bgm_id: {to_id}")
@@ -473,6 +502,14 @@ async def switch_bgm(to_id: str) -> bool:
     if not await connect():
         return False
 
+    # 旧 BGM ソース（target / SE 以外）をフェードアウト対象として収集
+    fade_out_sources = [
+        source for bgm_id, source in BGM_SOURCES.items()
+        if bgm_id != to_id and bgm_id != "se"
+    ]
+
+    # 新 BGM を音量 0 で表示開始 → RESTART で先頭再生
+    _set_input_volume_sync(target, 0.0)
     await set_source_visibility(target, True)
     try:
         ws_client.call(obs_requests.TriggerMediaInputAction(
@@ -482,12 +519,20 @@ async def switch_bgm(to_id: str) -> bool:
     except Exception as e:
         logger.warning(f"Failed to restart bgm '{target}': {e}")
 
-    for bgm_id, source in BGM_SOURCES.items():
-        if bgm_id == to_id or bgm_id == "se":
-            continue
-        await set_source_visibility(source, False)
+    # クロスフェード: 旧 BGM 1→0、 新 BGM 0→1 を並行で
+    fade_tasks = [
+        _fade_volume(src, 1.0, 0.0, _BGM_FADE_DURATION)
+        for src in fade_out_sources
+    ]
+    fade_tasks.append(_fade_volume(target, 0.0, 1.0, _BGM_FADE_DURATION))
+    await asyncio.gather(*fade_tasks)
 
-    logger.info(f"switch_bgm: -> {to_id}")
+    # フェードアウト完了後、 旧 BGM を非表示にして次回再表示時の音量を 1.0 に戻す
+    for src in fade_out_sources:
+        await set_source_visibility(src, False)
+        _set_input_volume_sync(src, 1.0)
+
+    logger.info(f"switch_bgm: -> {to_id} (cross-fade {_BGM_FADE_DURATION}s)")
     return True
 
 
