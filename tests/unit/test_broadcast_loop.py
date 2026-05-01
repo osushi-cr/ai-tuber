@@ -745,6 +745,18 @@ async def test_handle_closing_falls_back_to_gemini_when_pool_empty(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_handle_closing_stops_auto_filler_at_entry(monkeypatch):
+    """CLOSING 突入時に auto_filler_stop を queue 投入する（chitchat 割り込み防止）。"""
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
+    ctx = _make_ctx()
+
+    with patch("asyncio.sleep", return_value=None):
+        await handle_closing(ctx)
+
+    ctx.saint_graph.body.queue_auto_filler_stop.assert_called()
+
+
+@pytest.mark.asyncio
 async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog, monkeypatch):
     monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
     caplog.set_level("WARNING", logger="saint-graph")

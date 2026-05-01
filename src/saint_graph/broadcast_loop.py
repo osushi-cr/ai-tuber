@@ -507,7 +507,16 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     プール (`CLOSING_POOL_DIR` / data/mind/kurara/closings/closing_*.wav) が
     空の場合は従来通り Gemini で生成して再生する。
     None を返しループ終了。
+
+    auto_filler は CLOSING 突入時に停止する。 closing speech / ending 60s
+    の余韻に chitchat が割り込むのを防ぐ。
     """
+    # auto_filler を即停止（chitchat 割り込み防止）。 失敗しても致命ではない。
+    try:
+        await ctx.saint_graph.body.queue_auto_filler_stop()
+    except Exception as e:
+        logger.warning(f"Failed to queue auto_filler_stop at CLOSING: {e}")
+
     closings_dir = Path(os.getenv("CLOSING_POOL_DIR", "data/mind/kurara/closings"))
     candidates = (
         sorted(closings_dir.glob("closing_*.wav")) if closings_dir.exists() else []
