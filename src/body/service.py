@@ -10,7 +10,14 @@ class BodyServiceBase(ABC):
     """Body サービスが実装すべき共通インターフェース。"""
 
     @abstractmethod
-    async def speak(self, text: str, style: str = "neutral", speaker_id: Optional[int] = None) -> str:
+    async def speak(
+        self,
+        text: str,
+        style: str = "neutral",
+        speaker_id: Optional[int] = None,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+    ) -> Any:
         """テキストを発話します。"""
         ...
 
@@ -37,4 +44,13 @@ class BodyServiceBase(ABC):
     @abstractmethod
     async def wait_for_queue(self) -> str:
         """すべての処理が完了するまで待機します。"""
+        ...
+
+    @abstractmethod
+    async def wait_for_queue_strict(
+        self,
+        action_ids: Optional[list[str]] = None,
+        recent_count: Optional[int] = None,
+    ) -> bool:
+        """指定 action がすべて成功したか検査します。"""
         ...

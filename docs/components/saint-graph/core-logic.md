@@ -263,9 +263,9 @@ session = agent.start_session()
 ニュース読み上げでは、次ニュースの先読みを **生成フェーズ** と **再生フェーズ** に分けています。
 
 - `prepare_news_reading_text()`: Gemini で `(感情, 文)` のリストだけを生成し、Body の発話キューには投入しません。
-- `play_prepared_sentences()`: 生成済みの文を現在ニュースとして Body の発話キューに投入します。
+- `play_prepared_sentences()`: 生成済みの文を現在ニュースとして Body の発話キューに投入し、最初の `speak` の `action_id` を返します。
 
-これにより、現ニュースの再生中に次ニュースの Gemini 生成だけを並行化しつつ、`wait_for_queue()` は現ニュース分の発話完了だけを待ちます。未来ニュースの `speak` が先にキューへ積まれないため、OBS caption と読み上げ内容の対応が崩れません。
+これにより、現ニュースの再生中に次ニュースの Gemini 生成だけを並行化しつつ、`wait_for_queue_strict([speak_action_id])` は現ニュース分の発話・同期 caption の成功を確認します。未来ニュースの `speak` が先にキューへ積まれないため、OBS caption と読み上げ内容の対応が崩れません。
 
 ```python
 for sentence in sentences:

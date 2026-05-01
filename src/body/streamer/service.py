@@ -2,11 +2,13 @@
 import os
 import random
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
 import json
 import asyncio
+from uuid import uuid4
 
 # TTS engine selection
 #   TTS_ENGINE=irodori: Mac native Irodori-TTS (in-process, 16.7s/utterance)
@@ -32,6 +34,8 @@ FILLER_VOICE_DIR = Path(os.getenv(
     "FILLER_VOICE_DIR",
     str(Path.home() / "src/personal/Irodori-TTS/voice_library/kurara/presets")
 ))
+ACTION_STATUS_MAX = int(os.getenv("ACTION_STATUS_MAX", "200"))
+WAIT_STRICT_RECENT_LIMIT = int(os.getenv("WAIT_STRICT_RECENT_LIMIT", "20"))
 
 
 class StreamerBodyService(BodyServiceBase):
@@ -42,6 +46,7 @@ class StreamerBodyService(BodyServiceBase):
         self._youtube_comment_adapter = None
         self._current_broadcast_id = None
         self._action_queue = asyncio.Queue()
+        self._task_status: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._worker_task = None
         # Test/local injected comments (drained on each get_comments call).
         # In production this is empty and YouTube live chat fills the response.
@@ -67,6 +72,67 @@ class StreamerBodyService(BodyServiceBase):
         logger.info(f"[inject_comment] {author}: {message}")
         return "Comment injected"
 
+    def _remember_task_status(
+        self,
+        action_id: str,
+        status: str,
+        task_type: str,
+        payload: Dict[str, Any],
+        error: Optional[str] = None,
+    ) -> None:
+        """action_id ごとの状態を最新 ACTION_STATUS_MAX 件だけ保持する。"""
+        self._task_status[action_id] = {
+            "status": status,
+            "type": task_type,
+            "payload": payload,
+            "error": error,
+            "updated_at": time.time(),
+        }
+        self._task_status.move_to_end(action_id)
+        while len(self._task_status) > ACTION_STATUS_MAX:
+            self._task_status.popitem(last=False)
+
+    async def _enqueue_action(
+        self,
+        task_type: str,
+        payload: Dict[str, Any],
+        message: str,
+    ) -> Dict[str, Any]:
+        action_id = str(uuid4())
+        task = {"action_id": action_id, "type": task_type, **payload}
+        self._remember_task_status(action_id, "pending", task_type, payload)
+        await self._action_queue.put(task)
+        logger.info(f"[{task_type}:queued] action_id={action_id}")
+        return {"message": message, "action_id": action_id}
+
+    def _mark_action_running(self, task: Dict[str, Any]) -> None:
+        action_id = task["action_id"]
+        task_type = task.get("type", "unknown")
+        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
+        self._remember_task_status(action_id, "running", task_type, payload)
+
+    def _mark_action_completed(self, task: Dict[str, Any]) -> None:
+        action_id = task["action_id"]
+        task_type = task.get("type", "unknown")
+        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
+        self._remember_task_status(action_id, "completed", task_type, payload)
+
+    def _mark_action_failed(self, task: Dict[str, Any], error: BaseException) -> None:
+        action_id = task["action_id"]
+        task_type = task.get("type", "unknown")
+        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
+        error_text = str(error)
+        self._remember_task_status(action_id, "failed", task_type, payload, error_text)
+        logger.warning(
+            f"[action_id={action_id} type={task_type} payload={payload}] failed: {error_text}"
+        )
+
+    def _mark_action_cancelled(self, task: Dict[str, Any]) -> None:
+        action_id = task["action_id"]
+        task_type = task.get("type", "unknown")
+        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
+        self._remember_task_status(action_id, "cancelled", task_type, payload, "cancelled")
+
     async def start_worker(self):
         """バックグラウンドワーカーを開始します。"""
         if self._worker_task is None:
@@ -88,90 +154,175 @@ class StreamerBodyService(BodyServiceBase):
         """キューからタスクを取り出して順次実行するワーカー。"""
         logger.info("Action worker loop entered")
         while True:
+            task = None
+            task_done_called = False
             try:
                 task = await self._action_queue.get()
-                task_type = task.get("type")
-                
-                if task_type == "speak":
-                    text = task.get("text")
-                    style = task.get("style")
-                    speaker_id = task.get("speaker_id")
-
-                    try:
-                        # 1. 音声生成（2〜3秒かかる）
-                        file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
-
-                        # 2. 【初回 speak 時に waiting → kurara_main 切替 ＋ auto-filler 起動】
-                        if self._broadcasting and not self._first_speech_done:
-                            self._first_speech_done = True
-                            try:
-                                await obs_adapter.switch_scene(os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"))
-                            except Exception as e:
-                                logger.warning(f"Failed to switch to main scene on first speech: {e}")
-                            self._last_audio_end_time = time.time()
-                            if self._auto_filler_task is None or self._auto_filler_task.done():
-                                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
-                                logger.info("Auto-filler loop started on first speech")
-
-                        # 3. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
-                        await self.play_audio_with_sync_emotion(file_path, duration, style)
-                        
-                        # 4. 音声再生終了後、即座に口を閉じる
-                        await obs_adapter.set_visible_source("silent")
-
-                        logger.info(f"[Worker:speak] Completed: {text[:30]}...")
-                    except Exception as e:
-                        logger.error(f"Error in worker speak task: {e}")
-                
-                elif task_type == "change_emotion":
-                    emotion = task.get("emotion")
-                    try:
-                        await obs_adapter.set_visible_source(emotion)
-                        logger.info(f"[Worker:emotion] Changed to {emotion}")
-                    except Exception as e:
-                        logger.error(f"Error in worker emotion task: {e}")
-
-                elif task_type == "filler":
-                    file_path = task.get("file_path")
-                    style = task.get("style", "neutral")
-                    try:
-                        import wave
-                        with wave.open(file_path, "rb") as w:
-                            duration = w.getnframes() / float(w.getframerate())
-                        await self.play_audio_with_sync_emotion(file_path, duration, style)
-                        await obs_adapter.set_visible_source("silent")
-                        logger.info(f"[Worker:filler] Completed: {Path(file_path).name}")
-                    except Exception as e:
-                        logger.error(f"Error in worker filler task: {e}")
-
-                self._action_queue.task_done()
+                self._mark_action_running(task)
+                await self._handle_action(task)
+                self._mark_action_completed(task)
             except asyncio.CancelledError:
+                if task is not None:
+                    self._mark_action_cancelled(task)
+                    self._action_queue.task_done()
+                    task_done_called = True
                 break
             except Exception as e:
-                logger.error(f"Error in action worker loop: {e}")
-                await asyncio.sleep(1)
+                if task is None:
+                    logger.error(f"Error in action worker loop: {e}")
+                    await asyncio.sleep(1)
+                    continue
+                self._mark_action_failed(task, e)
+            finally:
+                if task is not None and not task_done_called:
+                    self._action_queue.task_done()
 
-    async def speak(self, text: str, style: str = "neutral", speaker_id: Optional[int] = None) -> str:
+    async def _handle_action(self, task: Dict[str, Any]) -> None:
+        task_type = task.get("type")
+
+        if task_type == "speak":
+            await self._handle_speak_action(task)
+        elif task_type == "change_emotion":
+            await self._handle_change_emotion_action(task)
+        elif task_type == "filler":
+            await self._handle_filler_action(task)
+        elif task_type == "caption_news":
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.update_news_caption,
+                task.get("title", ""),
+                task.get("summary", ""),
+            )
+            if not ok:
+                raise RuntimeError("caption_news failed")
+        elif task_type == "caption_clear":
+            ok = await obs_adapter.call_with_transient_retry(obs_adapter.clear_news_caption)
+            if not ok:
+                raise RuntimeError("caption_clear failed")
+        elif task_type == "scene_switch":
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.switch_scene,
+                task.get("scene"),
+            )
+            if not ok:
+                raise RuntimeError(f"scene_switch failed: {task.get('scene')}")
+        elif task_type == "bgm_switch":
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.switch_bgm,
+                task.get("bgm_id"),
+            )
+            if not ok:
+                raise RuntimeError(f"bgm_switch failed: {task.get('bgm_id')}")
+        elif task_type == "bgm_play":
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.play_bgm,
+                task.get("bgm_id"),
+                restart=task.get("restart", True),
+            )
+            if not ok:
+                raise RuntimeError(f"bgm_play failed: {task.get('bgm_id')}")
+        elif task_type == "bgm_stop":
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.stop_bgm,
+                task.get("bgm_id"),
+            )
+            if not ok:
+                raise RuntimeError(f"bgm_stop failed: {task.get('bgm_id')}")
+        else:
+            raise RuntimeError(f"unknown action type: {task_type}")
+
+    async def _handle_speak_action(self, task: Dict[str, Any]) -> None:
+        text = task.get("text")
+        style = task.get("style")
+        speaker_id = task.get("speaker_id")
+        caption_title = task.get("caption_title")
+        caption_summary = task.get("caption_summary")
+
+        # 1. 音声生成（2〜3秒かかる）
+        file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
+
+        # 2. 【初回 speak 時に waiting → kurara_main 切替 ＋ auto-filler 起動】
+        if self._broadcasting and not self._first_speech_done:
+            self._first_speech_done = True
+            try:
+                await obs_adapter.call_with_transient_retry(
+                    obs_adapter.switch_scene,
+                    os.getenv("BROADCAST_MAIN_SCENE", "kurara_main"),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to switch to main scene on first speech: {e}")
+            self._last_audio_end_time = time.time()
+            if self._auto_filler_task is None or self._auto_filler_task.done():
+                self._auto_filler_task = asyncio.create_task(self._auto_filler_loop())
+                logger.info("Auto-filler loop started on first speech")
+
+        # 3. caption 付き speak は、音声生成完了後・再生開始直前に更新する。
+        if caption_title is not None or caption_summary is not None:
+            ok = await obs_adapter.call_with_transient_retry(
+                obs_adapter.update_news_caption,
+                caption_title or "",
+                caption_summary or "",
+            )
+            if not ok:
+                raise RuntimeError("caption update before speak failed")
+
+        # 4. 表情変更と音声再生を「同時」に開始（ズレをゼロに近づける）
+        ok = await self.play_audio_with_sync_emotion(file_path, duration, style)
+        if not ok:
+            raise RuntimeError("audio playback failed")
+
+        # 5. 音声再生終了後、即座に口を閉じる
+        await obs_adapter.set_visible_source("silent")
+
+        logger.info(f"[Worker:speak] Completed: {text[:30]}...")
+
+    async def _handle_change_emotion_action(self, task: Dict[str, Any]) -> None:
+        emotion = task.get("emotion")
+        await obs_adapter.set_visible_source(emotion)
+        logger.info(f"[Worker:emotion] Changed to {emotion}")
+
+    async def _handle_filler_action(self, task: Dict[str, Any]) -> None:
+        file_path = task.get("file_path")
+        style = task.get("style", "neutral")
+        import wave
+
+        with wave.open(file_path, "rb") as w:
+            duration = w.getnframes() / float(w.getframerate())
+        ok = await self.play_audio_with_sync_emotion(file_path, duration, style)
+        if not ok:
+            raise RuntimeError("filler audio playback failed")
+        await obs_adapter.set_visible_source("silent")
+        logger.info(f"[Worker:filler] Completed: {Path(file_path).name}")
+
+    async def speak(
+        self,
+        text: str,
+        style: str = "neutral",
+        speaker_id: Optional[int] = None,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """視聴者に対してテキストを発話します (キューに追加して即時復帰)。"""
-        await self._action_queue.put({
-            "type": "speak",
+        result = await self._enqueue_action("speak", {
             "text": text,
             "style": style,
-            "speaker_id": speaker_id
-        })
+            "speaker_id": speaker_id,
+            "caption_title": caption_title,
+            "caption_summary": caption_summary,
+        }, "Speech queued")
         logger.info(f"[speak:queued] '{text[:30]}...'")
-        return "Speech queued"
+        return result
 
-    async def change_emotion(self, emotion: str) -> str:
+    async def change_emotion(self, emotion: str) -> Dict[str, Any]:
         """アバターの表情（感情）を変更します (キューに追加して即時復帰)。"""
-        await self._action_queue.put({
-            "type": "change_emotion",
-            "emotion": emotion
-        })
+        result = await self._enqueue_action(
+            "change_emotion",
+            {"emotion": emotion},
+            "Emotion change queued",
+        )
         logger.info(f"[change_emotion:queued] {emotion}")
-        return "Emotion change queued"
+        return result
 
-    async def play_filler(self, category: str, style: str = "neutral") -> str:
+    async def play_filler(self, category: str, style: str = "neutral") -> Dict[str, Any] | str:
         """category 該当の filler wav をランダム選択して voice ソースで再生します。
 
         category: "aizuchi" / "thinking" / "reaction" / "intro" / "outro" 等。
@@ -183,43 +334,60 @@ class StreamerBodyService(BodyServiceBase):
         if not candidates:
             return f"No filler wav found for category: {category}"
         chosen = random.choice(candidates)
-        await self._action_queue.put({
-            "type": "filler",
+        result = await self._enqueue_action("filler", {
             "file_path": str(chosen),
             "style": style,
-        })
+        }, f"Filler queued: {chosen.name}")
         logger.info(f"[filler:queued] category={category} file={chosen.name}")
-        return f"Filler queued: {chosen.name}"
+        return result
 
-    async def play_bgm(self, bgm_id: str, restart: bool = True) -> str:
-        """BGM ソースを表示し再生します（obs_adapter のラッパー）。"""
-        ok = await obs_adapter.play_bgm(bgm_id, restart=restart)
-        return f"BGM '{bgm_id}' started" if ok else f"Failed to play BGM '{bgm_id}'"
+    async def play_bgm(self, bgm_id: str, restart: bool = True) -> Dict[str, Any]:
+        """BGM ソースを表示し再生します（presentation queue に投入）。"""
+        return await self._enqueue_action(
+            "bgm_play",
+            {"bgm_id": bgm_id, "restart": restart},
+            f"BGM '{bgm_id}' queued",
+        )
 
-    async def stop_bgm(self, bgm_id: str) -> str:
-        """BGM ソースを非表示にして停止します（obs_adapter のラッパー）。"""
-        ok = await obs_adapter.stop_bgm(bgm_id)
-        return f"BGM '{bgm_id}' stopped" if ok else f"Failed to stop BGM '{bgm_id}'"
+    async def stop_bgm(self, bgm_id: str) -> Dict[str, Any]:
+        """BGM ソースを非表示にして停止します（presentation queue に投入）。"""
+        return await self._enqueue_action(
+            "bgm_stop",
+            {"bgm_id": bgm_id},
+            f"BGM '{bgm_id}' stop queued",
+        )
 
-    async def switch_bgm(self, bgm_id: str) -> str:
+    async def switch_bgm(self, bgm_id: str) -> Dict[str, Any]:
         """指定BGMへ切替（他のループ系BGMを停止）し、SE は触りません。"""
-        ok = await obs_adapter.switch_bgm(bgm_id)
-        return f"BGM switched to '{bgm_id}'" if ok else f"Failed to switch BGM to '{bgm_id}'"
+        return await self._enqueue_action(
+            "bgm_switch",
+            {"bgm_id": bgm_id},
+            f"BGM switch to '{bgm_id}' queued",
+        )
 
-    async def switch_scene(self, scene_name: str) -> str:
+    async def switch_scene(self, scene_name: str) -> Dict[str, Any]:
         """OBS のプログラムシーンを切り替える（waiting / kurara_main / ending 等）。"""
-        ok = await obs_adapter.switch_scene(scene_name)
-        return f"Scene switched to '{scene_name}'" if ok else f"Failed to switch scene to '{scene_name}'"
+        return await self._enqueue_action(
+            "scene_switch",
+            {"scene": scene_name},
+            f"Scene switch to '{scene_name}' queued",
+        )
 
-    async def update_news_caption(self, title: str, summary: str) -> str:
+    async def update_news_caption(self, title: str, summary: str) -> Dict[str, Any]:
         """OBS のニュースキャプション（タイトル＋要約）を更新する。"""
-        ok = await obs_adapter.update_news_caption(title, summary)
-        return "News caption updated" if ok else "Failed to update news caption"
+        return await self._enqueue_action(
+            "caption_news",
+            {"title": title, "summary": summary},
+            "News caption queued",
+        )
 
-    async def clear_news_caption(self) -> str:
+    async def clear_news_caption(self) -> Dict[str, Any]:
         """OBS のニュースキャプションを空にする。"""
-        ok = await obs_adapter.clear_news_caption()
-        return "News caption cleared" if ok else "Failed to clear news caption"
+        return await self._enqueue_action(
+            "caption_clear",
+            {},
+            "News caption clear queued",
+        )
 
     async def peek_comments(self) -> str:
         """OBS overlay 表示用にコメントを peek する（buffer を破壊しない）。
@@ -279,7 +447,10 @@ class StreamerBodyService(BodyServiceBase):
 
         # 前回配信時のニュースキャプションが残らないよう、配信開始時に必ず初期化する。
         try:
-            await obs_adapter.clear_news_caption()
+            clear_result = await self.clear_news_caption()
+            ok = await self.wait_for_queue_strict([clear_result["action_id"]])
+            if not ok:
+                logger.warning("Failed to clear news caption at broadcast start")
         except Exception as e:
             logger.warning(f"Failed to clear news caption at broadcast start: {e}")
 
@@ -378,14 +549,41 @@ class StreamerBodyService(BodyServiceBase):
         logger.info("Action queue is empty")
         return "All queued actions completed"
 
+    async def wait_for_queue_strict(
+        self,
+        action_ids: Optional[list[str]] = None,
+        recent_count: Optional[int] = None,
+    ) -> bool:
+        """キュー消化後、指定 action がすべて completed か検査する。"""
+        logger.info("Waiting for action queue to be empty (strict)...")
+        await self._action_queue.join()
+        target_ids = action_ids
+        if target_ids is None:
+            limit = recent_count or WAIT_STRICT_RECENT_LIMIT
+            target_ids = list(self._task_status.keys())[-limit:]
+
+        for action_id in target_ids:
+            status = self._task_status.get(action_id)
+            if status is None:
+                logger.warning(f"wait_for_queue_strict: unknown action_id={action_id}")
+                return False
+            if status.get("status") != "completed":
+                logger.warning(
+                    f"wait_for_queue_strict: action_id={action_id} status={status.get('status')}"
+                )
+                return False
+        return True
+
     # --- ヘルパーメソッドおよび固有メソッド ---
 
-    async def play_audio_with_sync_emotion(self, file_path: str, duration: float, emotion: str) -> str:
+    async def play_audio_with_sync_emotion(self, file_path: str, duration: float, emotion: str) -> bool:
         """音声の装填を先に済ませ、表情切り替えと再生開始を同時に叩き込みます。"""
         try:
             logger.info(f"[play_audio_sync] Starting playback of {file_path} (duration: {duration:.1f}s) with emotion: {emotion}")
             # obs_adapter側の新メソッドを呼び出す（表情と音声を同時着火）
-            await obs_adapter.play_media_with_emotion("voice", file_path, emotion)
+            ok = await obs_adapter.play_media_with_emotion("voice", file_path, emotion)
+            if not ok:
+                raise RuntimeError("play_media_with_emotion returned false")
 
             # 再生完了まで待機
             await asyncio.sleep(duration + 0.1)
@@ -394,12 +592,12 @@ class StreamerBodyService(BodyServiceBase):
             self._last_audio_end_time = time.time()
 
             logger.info(f"[play_audio_sync] Completed playback ({duration:.1f}s)")
-            return f"再生完了 ({duration:.1f}s)"
+            return True
         except Exception as e:
             logger.error(f"Error in play_audio_sync: {e}")
-            return f"再生エラー: {str(e)}"
+            raise
 
-    async def play_audio_file(self, file_path: str, duration: float) -> str:
+    async def play_audio_file(self, file_path: str, duration: float) -> bool:
         """（互換性用）通常の音声再生。内部的に同期再生を使用します。"""
         return await self.play_audio_with_sync_emotion(file_path, duration, "neutral")
 

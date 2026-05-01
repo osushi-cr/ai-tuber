@@ -25,7 +25,7 @@ async def test_speaker_id_passed_to_body_client():
     
     with patch("saint_graph.saint_graph.BodyClient") as mock_body_class:
         mock_body = mock_body_class.return_value
-        mock_body.speak = AsyncMock()
+        mock_body.queue_speak = AsyncMock(return_value={"action_id": "speak-1"})
         mock_body.change_emotion = AsyncMock()
         mock_body.wait_for_queue = AsyncMock()
         
@@ -52,8 +52,8 @@ async def test_speaker_id_passed_to_body_client():
         await sg.process_turn("test input")
         
         # speaker_id=58が渡されることを確認
-        mock_body.speak.assert_called_once()
-        call_args = mock_body.speak.call_args
+        mock_body.queue_speak.assert_called_once()
+        call_args = mock_body.queue_speak.call_args
         assert call_args.kwargs["speaker_id"] == 58
         assert call_args.args[0] == "Hello from test"
         assert call_args.kwargs["style"] == "neutral"
@@ -65,7 +65,7 @@ async def test_no_speaker_id_defaults_to_none():
     """mind_configがない場合、speaker_id=Noneが渡される"""
     with patch("saint_graph.saint_graph.BodyClient") as mock_body_class:
         mock_body = mock_body_class.return_value
-        mock_body.speak = AsyncMock()
+        mock_body.queue_speak = AsyncMock(return_value={"action_id": "speak-1"})
         mock_body.change_emotion = AsyncMock()
         mock_body.wait_for_queue = AsyncMock()
         
@@ -92,8 +92,8 @@ async def test_no_speaker_id_defaults_to_none():
         await sg.process_turn("test input")
         
         # speaker_id=Noneが渡されることを確認
-        mock_body.speak.assert_called_once()
-        call_args = mock_body.speak.call_args
+        mock_body.queue_speak.assert_called_once()
+        call_args = mock_body.queue_speak.call_args
         assert call_args.kwargs["speaker_id"] is None
 
 
@@ -105,7 +105,7 @@ async def test_speaker_id_zero_is_valid():
     
     with patch("saint_graph.saint_graph.BodyClient") as mock_body_class:
         mock_body = mock_body_class.return_value
-        mock_body.speak = AsyncMock()
+        mock_body.queue_speak = AsyncMock(return_value={"action_id": "speak-1"})
         mock_body.change_emotion = AsyncMock()
         mock_body.wait_for_queue = AsyncMock()
         
@@ -132,8 +132,8 @@ async def test_speaker_id_zero_is_valid():
         await sg.process_turn("test input")
         
         # speaker_id=0が渡されることを確認（Falsy値だがNoneではない）
-        mock_body.speak.assert_called_once()
-        call_args = mock_body.speak.call_args
+        mock_body.queue_speak.assert_called_once()
+        call_args = mock_body.queue_speak.call_args
         assert call_args.kwargs["speaker_id"] == 0
 
 
@@ -145,7 +145,10 @@ async def test_multiple_sentences_use_same_speaker_id():
     
     with patch("saint_graph.saint_graph.BodyClient") as mock_body_class:
         mock_body = mock_body_class.return_value
-        mock_body.speak = AsyncMock()
+        mock_body.queue_speak = AsyncMock(side_effect=[
+            {"action_id": "speak-1"},
+            {"action_id": "speak-2"},
+        ])
         mock_body.change_emotion = AsyncMock()
         mock_body.wait_for_queue = AsyncMock()
         
@@ -172,6 +175,6 @@ async def test_multiple_sentences_use_same_speaker_id():
         await sg.process_turn("test input")
         
         # 両方のspeakコールでspeaker_id=42が使われる
-        assert mock_body.speak.call_count == 2
-        for call in mock_body.speak.call_args_list:
+        assert mock_body.queue_speak.call_count == 2
+        for call in mock_body.queue_speak.call_args_list:
             assert call.kwargs["speaker_id"] == 42

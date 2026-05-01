@@ -33,6 +33,7 @@ class BroadcastContext:
     idle_counter: int = 0
     # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
     next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
+    closing_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +98,67 @@ def _filter_meaningful_comments(
     return (questions + others)[:max_count]
 
 
+def _extract_action_id(response: Any) -> Optional[str]:
+    if isinstance(response, dict):
+        action_id = response.get("action_id")
+        if isinstance(action_id, str):
+            return action_id
+    return None
+
+
+async def _queue_news_entry_presentation(ctx: BroadcastContext) -> Optional[str]:
+    """NEWS 入口で必須の scene 切替を queue 経由で投入し、action_id を返す。"""
+    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+    response = await ctx.saint_graph.body.queue_scene_switch(main_scene)
+    action_id = _extract_action_id(response)
+    if not action_id:
+        logger.warning("NEWS presentation setup did not return action_id")
+        return None
+    return action_id
+
+
+async def _play_news_sentences_with_retry(
+    ctx: BroadcastContext,
+    sentences: List[Tuple[str, str]],
+    caption_title: str,
+    caption_summary: str,
+) -> bool:
+    """caption 同期付き speak を投入し、caption/音声失敗を 1 回だけ retry する。"""
+    for attempt in range(2):
+        try:
+            scene_action_id = await _queue_news_entry_presentation(ctx)
+            if not scene_action_id:
+                await ctx.saint_graph.body.wait_for_queue()
+                ok = False
+            else:
+                speak_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
+                    sentences,
+                    caption_title=caption_title,
+                    caption_summary=caption_summary,
+                    wait_after=False,
+                )
+                if not speak_action_ids:
+                    logger.warning("NEWS speak did not return action_id")
+                    await ctx.saint_graph.body.wait_for_queue()
+                    ok = False
+                else:
+                    ok = await ctx.saint_graph.body.wait_for_queue_strict(
+                        [scene_action_id, *speak_action_ids]
+                    )
+
+            if ok:
+                return True
+            if attempt == 0:
+                logger.warning("NEWS speak/caption action failed on attempt 1; retrying once")
+            else:
+                logger.warning("NEWS speak/caption action failed on attempt 2")
+        except Exception as e:
+            logger.warning(f"NEWS speak/caption action error on attempt {attempt + 1}: {e}")
+
+    logger.warning("NEWS speak/caption action failed twice. Falling back to CLOSING.")
+    return False
+
+
 async def _poll_and_respond(ctx: BroadcastContext) -> bool:
     """
     コメントをポーリングし、あれば応答します。
@@ -154,6 +216,20 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 
     await intro_task
 
+    # NEWS フェーズへ入る前に kurara_main シーン切替を確定させる。
+    # 通常は worker の初回 speak ハンドラが intro 開始時点で切替済みだが、
+    # intro が短文 / Gemini 失敗で speak が走らなかった場合や、シーン切替の
+    # 反映遅延で handle_news の update_news_caption が waiting 残存中に
+    # 走るタイミングを防ぐ保険。既に kurara_main なら no-op で済む。
+    try:
+        main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+        await ctx.saint_graph.body.switch_scene(main_scene)
+        # OBS の SetCurrentProgramScene 受領後、シーン上のソース更新が
+        # 反映されるまでの短い遅延を吸収する。
+        await asyncio.sleep(float(os.getenv("MAIN_SCENE_SETTLE_SECONDS", "0.3")))
+    except Exception as e:
+        logger.warning(f"Failed to ensure main scene before NEWS: {e}")
+
     return BroadcastPhase.NEWS
 
 
@@ -164,7 +240,7 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     プリフェッチ最適化:
     - 現ニュースのセリフは ctx.next_news_task に既に生成されているはず（無ければ即時生成）
     - 現ニュース再生開始前に「次のニュース」のセリフ生成 task をキック
-    - 再生完了を wait_for_queue で待機 → 次ループへ
+    - 再生完了と caption/音声の成否を wait_for_queue_strict で確認 → 次ループへ
 
     ニュースを全消化したら QA へ遷移する。
     """
@@ -188,10 +264,6 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
         return BroadcastPhase.QA
 
     logger.info(f"Reading news item: {item.title}")
-    try:
-        await ctx.saint_graph.body.update_news_caption(item.title, item.content)
-    except Exception as e:
-        logger.warning(f"Failed to update news caption: {e}")
 
     # 現ニュース: prefetch 済 task があれば生成結果を使い、無ければ即時生成
     if ctx.next_news_task is not None:
@@ -222,10 +294,16 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
                 )
             )
 
-    await ctx.saint_graph.play_prepared_sentences(sentences, wait_after=False)
-
-    # 現ニュースの音声再生完了を待つ（auto-filler 起動条件にも影響するので必須）
-    await ctx.saint_graph.body.wait_for_queue()
+    # 現ニュースの caption 同期と音声再生完了を strict に確認する。
+    # caption は最初の speak action 内で更新されるため、speak action_id を監視する。
+    if not await _play_news_sentences_with_retry(
+        ctx,
+        sentences,
+        caption_title=item.title,
+        caption_summary=item.content,
+    ):
+        ctx.closing_reason = "technical_failure"
+        return BroadcastPhase.CLOSING
 
     # ニュース完了 → aizuchi 系 filler を 1 個積んで次のセリフ生成中の沈黙を埋める
     try:
@@ -269,7 +347,7 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
 
 async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     """CLOSING: 締めの挨拶をしてリソースを解放する。None を返しループ終了。"""
-    await ctx.saint_graph.process_closing()
+    await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
 
     # すべての発話が完了するまで待機（キューの消化待機）
     logger.info("Waiting for final speech to complete...")

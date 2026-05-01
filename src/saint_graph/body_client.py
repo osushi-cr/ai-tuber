@@ -65,18 +65,50 @@ class BodyClient:
                 )
                 return None
     
-    async def speak(self, text: str, style: Optional[str] = None, speaker_id: Optional[int] = None) -> str:
-        """アバターに発話させます。"""
+    async def _queue_request(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """queue 投入系 endpoint のレスポンスをそのまま返す。"""
+        data = await self._request("POST", path, payload)
+        if data:
+            return data
+        return {"status": "error", "result": f"Error: Failed to call {path}"}
+
+    async def queue_speak(
+        self,
+        text: str,
+        style: Optional[str] = None,
+        speaker_id: Optional[int] = None,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """発話 action を queue に投入し、action_id を含むレスポンスを返す。"""
         payload = {"text": text}
         if style:
             payload["style"] = style
         if speaker_id is not None:
             payload["speaker_id"] = speaker_id
-        
-        data = await self._request("POST", "/api/speak", payload)
-        if data:
-            return data.get("result", "Speaking completed")
-        return "Error: Failed to call speak API"
+        if caption_title is not None:
+            payload["caption_title"] = caption_title
+        if caption_summary is not None:
+            payload["caption_summary"] = caption_summary
+        return await self._queue_request("/api/speak", payload)
+
+    async def speak(
+        self,
+        text: str,
+        style: Optional[str] = None,
+        speaker_id: Optional[int] = None,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+    ) -> str:
+        """アバターに発話させます。"""
+        data = await self.queue_speak(
+            text,
+            style=style,
+            speaker_id=speaker_id,
+            caption_title=caption_title,
+            caption_summary=caption_summary,
+        )
+        return data.get("result", "Speaking completed")
     
     async def change_emotion(self, emotion: str) -> str:
         """アバターの表情を変更します。"""
@@ -113,28 +145,48 @@ class BodyClient:
             return data.get("result", "Wait completed")
         return "Error: Failed to wait for queue"
 
+    async def wait_for_queue_strict(
+        self,
+        action_ids: Optional[List[str]] = None,
+        timeout: float = 300.0,
+        recent_count: Optional[int] = None,
+    ) -> bool:
+        """キュー完了後、対象 action が failed なしで完了したか確認します。"""
+        payload: Dict[str, Any] = {}
+        if action_ids is not None:
+            payload["action_ids"] = action_ids
+        if recent_count is not None:
+            payload["recent_count"] = recent_count
+        data = await self._request("POST", "/api/queue/wait_strict", payload, timeout=timeout)
+        if data:
+            return bool(data.get("result", False))
+        return False
+
+    async def queue_bgm_switch(self, bgm_id: str) -> Dict[str, Any]:
+        return await self._queue_request("/api/bgm/switch", {"bgm_id": bgm_id})
+
     async def switch_bgm(self, bgm_id: str) -> str:
         """指定 BGM へ切替（他のループ系 BGM は停止）。"""
-        data = await self._request("POST", "/api/bgm/switch", {"bgm_id": bgm_id})
-        if data:
-            return data.get("result", f"BGM switched to {bgm_id}")
-        return f"Error: Failed to switch BGM to {bgm_id}"
+        data = await self.queue_bgm_switch(bgm_id)
+        return data.get("result", f"BGM switched to {bgm_id}")
+
+    async def queue_bgm_play(self, bgm_id: str, restart: bool = True) -> Dict[str, Any]:
+        return await self._queue_request(
+            "/api/bgm/play", {"bgm_id": bgm_id, "restart": restart}
+        )
 
     async def play_bgm(self, bgm_id: str, restart: bool = True) -> str:
         """指定 BGM を表示・先頭から再生。SE のような単発再生にも使う。"""
-        data = await self._request(
-            "POST", "/api/bgm/play", {"bgm_id": bgm_id, "restart": restart}
-        )
-        if data:
-            return data.get("result", f"BGM {bgm_id} started")
-        return f"Error: Failed to play BGM {bgm_id}"
+        data = await self.queue_bgm_play(bgm_id, restart=restart)
+        return data.get("result", f"BGM {bgm_id} started")
+
+    async def queue_bgm_stop(self, bgm_id: str) -> Dict[str, Any]:
+        return await self._queue_request("/api/bgm/stop", {"bgm_id": bgm_id})
 
     async def stop_bgm(self, bgm_id: str) -> str:
         """指定 BGM ソースを非表示・停止する。"""
-        data = await self._request("POST", "/api/bgm/stop", {"bgm_id": bgm_id})
-        if data:
-            return data.get("result", f"BGM {bgm_id} stopped")
-        return f"Error: Failed to stop BGM {bgm_id}"
+        data = await self.queue_bgm_stop(bgm_id)
+        return data.get("result", f"BGM {bgm_id} stopped")
 
     async def play_filler(self, category: str, style: str = "neutral") -> str:
         """category 該当の filler wav をランダムで voice ソースに流す。"""
@@ -152,26 +204,31 @@ class BodyClient:
             return data.get("result", f"Registered {len(lines)} chitchat lines")
         return "Error: Failed to register chitchat lines"
 
+    async def queue_scene_switch(self, scene_name: str) -> Dict[str, Any]:
+        return await self._queue_request("/api/scene/switch", {"scene": scene_name})
+
     async def switch_scene(self, scene_name: str) -> str:
         """OBS のプログラムシーンを切り替える。"""
-        data = await self._request("POST", "/api/scene/switch", {"scene": scene_name})
-        if data:
-            return data.get("result", f"Scene switched to {scene_name}")
-        return f"Error: Failed to switch scene to {scene_name}"
+        data = await self.queue_scene_switch(scene_name)
+        return data.get("result", f"Scene switched to {scene_name}")
+
+    async def queue_caption_news(self, title: str, summary: str) -> Dict[str, Any]:
+        return await self._queue_request(
+            "/api/caption/news", {"title": title, "summary": summary}
+        )
 
     async def update_news_caption(self, title: str, summary: str) -> str:
         """OBS のニュースキャプション（タイトル＋要約）を更新する。"""
-        data = await self._request("POST", "/api/caption/news", {"title": title, "summary": summary})
-        if data:
-            return data.get("result", "News caption updated")
-        return "Error: Failed to update news caption"
+        data = await self.queue_caption_news(title, summary)
+        return data.get("result", "News caption updated")
+
+    async def queue_caption_clear(self) -> Dict[str, Any]:
+        return await self._queue_request("/api/caption/clear", {})
 
     async def clear_news_caption(self) -> str:
         """OBS のニュースキャプションを空にする。"""
-        data = await self._request("POST", "/api/caption/clear", {})
-        if data:
-            return data.get("result", "News caption cleared")
-        return "Error: Failed to clear news caption"
+        data = await self.queue_caption_clear()
+        return data.get("result", "News caption cleared")
 
     async def health_check(self) -> bool:
         """Body サービスの稼働状態を確認します。"""

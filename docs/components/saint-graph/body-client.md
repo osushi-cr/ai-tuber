@@ -28,14 +28,16 @@ body_client = BodyClient(base_url=config.BODY_URL)
 
 ## メソッド
 
-### speak(text, style, speaker_id=None)
+### speak(text, style, speaker_id=None, caption_title=None, caption_summary=None)
 
 テキストを発話させます。
 
 ```python
 await body_client.speak(
     text="こんにちは、今日は良い天気ですね！",
-    style="joyful"
+    style="joyful",
+    caption_title="今日のニュース",
+    caption_summary="見出しの要約"
 )
 ```
 
@@ -43,11 +45,15 @@ await body_client.speak(
 - `text` (str): 発話させるテキスト
 - `style` (str): 発話スタイル（neutral, joyful, fun, angry, sad）
 - `speaker_id` (int, Optional): 声の ID（style より優先）
+- `caption_title` / `caption_summary` (str, Optional): 最初の音声再生直前に同期更新するニュースキャプション
 
 **内部処理** (Streamer モード):
 1. リクエストを送信し、Body 側で内部キューに追加
 2. キューにより、前後の発話や表情変更と順次実行される
-3. **非ブロッキング**: 本メソッドはキューへの追加が完了した時点で即時復帰します（Mind 側で待機する必要がありません）。
+3. caption 指定がある場合は、Body worker が音声生成完了後・再生開始直前に OBS caption を更新
+4. **非ブロッキング**: 本メソッドはキューへの追加が完了した時点で即時復帰します（Mind 側で待機する必要がありません）。
+
+`queue_speak()` を使うと、`action_id` を含む REST レスポンスを取得できます。
 
 ### change_emotion(emotion)
 
@@ -101,6 +107,33 @@ await body_client.wait_for_queue()
 ```
 
 - **用途**: 配信のリズムを整えるために、1つのフェーズやターンが終わる際に AI が最後まで話し終えるのを待つために使用します。通信による「間」を詰めつつ、対話のリズムを維持するための「いいとこ取り」構成の要となります。
+
+### wait_for_queue_strict(action_ids=None, timeout=300.0, recent_count=None)
+
+キューの消化を待ったうえで、指定した `action_id` がすべて `completed` になったか検査します。
+
+```python
+res = await body_client.queue_scene_switch("kurara_main")
+ok = await body_client.wait_for_queue_strict([res["action_id"]])
+```
+
+- `True`: 指定 action がすべて成功
+- `False`: 1 件以上が失敗、キャンセル、または未知の action_id
+
+### presentation queue 操作
+
+以下のメソッドは caption / scene / BGM / filler を presentation queue に投入します。
+
+| メソッド | 用途 |
+|---|---|
+| `queue_caption_news(title, summary)` | ニュースキャプション更新 |
+| `queue_caption_clear()` | ニュースキャプション消去 |
+| `queue_scene_switch(scene_name)` | OBS シーン切替 |
+| `queue_bgm_switch(bgm_id)` | ループ系 BGM 切替 |
+| `queue_bgm_play(bgm_id, restart=True)` | BGM / SE 再生 |
+| `queue_bgm_stop(bgm_id)` | BGM / SE 停止 |
+
+既存の `update_news_caption()` / `clear_news_caption()` / `switch_scene()` / `switch_bgm()` / `play_bgm()` / `stop_bgm()` も同じ endpoint を呼びますが、戻り値は従来通り表示用文字列です。action_id が必要な場合は `queue_*` メソッドを使います。
 
 ---
 

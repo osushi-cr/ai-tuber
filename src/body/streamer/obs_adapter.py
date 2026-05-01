@@ -77,6 +77,34 @@ _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _source_id_cache = {}
 _current_scene_name = None
 
+
+def _is_transient_obs_error(error: BaseException) -> bool:
+    """OBS websocket の一時切断・タイムアウトとして扱う例外を判定する。"""
+    return isinstance(error, (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError))
+
+
+async def call_with_transient_retry(func, *args, **kwargs) -> bool:
+    """OBS 操作を実行し、一時的な接続不良なら 1 回だけ再接続して retry する。"""
+    for attempt in range(2):
+        try:
+            ok = await func(*args, **kwargs)
+            if ok:
+                return True
+            if attempt == 0:
+                logger.warning(f"{func.__name__} returned false; reconnecting OBS and retrying once")
+                await disconnect()
+                await asyncio.sleep(0.2)
+                continue
+            return False
+        except Exception as e:
+            if attempt == 0 and _is_transient_obs_error(e):
+                logger.warning(f"{func.__name__} transient OBS error; retrying once: {e}")
+                await disconnect()
+                await asyncio.sleep(0.2)
+                continue
+            raise
+    return False
+
 def _on_media_start(event):
     """OBSからのメディア再生開始イベントを受け取るコールバック"""
     try:

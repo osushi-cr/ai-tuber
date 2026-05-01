@@ -21,14 +21,16 @@ Saint Graph から Body への指令送信に使用します。
 
 ### 1. POST /api/speak
 
-アバターに発話させます（キューに追加して即時復帰）。
+アバターに発話させます（presentation queue に追加して即時復帰）。
 
 **Request Body**:
 ```json
 {
   "text": "発話させるテキスト内容",
   "style": "neutral",  // neutral, joyful, fun, angry, sad
-  "speaker_id": 46     // オプション。指定された場合は style より優先
+  "speaker_id": 46,    // オプション。指定された場合は style より優先
+  "caption_title": "ニュース見出し",      // オプション
+  "caption_summary": "ニュース本文要約"   // オプション
 }
 ```
 
@@ -36,7 +38,8 @@ Saint Graph から Body への指令送信に使用します。
 ```json
 {
   "status": "ok",
-  "result": "発話完了"
+  "result": "Speech queued",
+  "action_id": "uuid4"
 }
 ```
 
@@ -44,10 +47,11 @@ Saint Graph から Body への指令送信に使用します。
 - `speaker_id` が指定された場合、`style` は無視されます
 - VoiceVox の話者ID を直接指定できます
 - **Streamer モード**: 指定された発話内容は内部キューに追加され、順次再生されます。
+- `caption_title` / `caption_summary` を指定した場合、Body worker は音声生成完了後、音声再生開始の直前にニュースキャプションを更新します。
 
 ### 2. POST /api/change_emotion
 
-アバターの表情を変更します（キューに追加して即時復帰）。
+アバターの表情を変更します（presentation queue に追加して即時復帰）。
 
 **Request Body**:
 ```json
@@ -60,7 +64,8 @@ Saint Graph から Body への指令送信に使用します。
 ```json
 {
   "status": "ok",
-  "result": "表情を joyful に変更しました"
+  "result": "Emotion change queued",
+  "action_id": "uuid4"
 }
 ```
 
@@ -71,7 +76,7 @@ Saint Graph から Body への指令送信に使用します。
 
 ### 3. GET /api/comments
 
-直近のユーザーコメントを取得します（ポーリング用）。
+OBS overlay 表示用に直近のユーザーコメントを取得します。buffer は破壊しません。
 
 **Response (共通)**:
 ```json
@@ -87,7 +92,47 @@ Saint Graph から Body への指令送信に使用します。
 }
 ```
 
-### 4. POST /api/broadcast/start
+Saint Graph がコメント反応用に buffer を drain する場合は `POST /api/comments/consume` を使います。
+
+### 4. presentation queue 操作用 endpoint
+
+以下はすべて presentation queue に action を投入して即時復帰します。レスポンスには `action_id` が含まれます。
+
+| Endpoint | 用途 | Request Body |
+|---|---|---|
+| `POST /api/caption/news` | ニュースキャプション更新 | `{"title": "...", "summary": "..."}` |
+| `POST /api/caption/clear` | ニュースキャプション消去 | `{}` |
+| `POST /api/scene/switch` | OBS シーン切替 | `{"scene": "kurara_main"}` |
+| `POST /api/bgm/switch` | ループ系 BGM 切替 | `{"bgm_id": "news"}` |
+| `POST /api/bgm/play` | BGM / SE 再生 | `{"bgm_id": "se", "restart": true}` |
+| `POST /api/bgm/stop` | BGM / SE 停止 | `{"bgm_id": "se"}` |
+| `POST /api/filler/play` | filler wav 再生 | `{"category": "aizuchi", "style": "neutral"}` |
+
+### 5. POST /api/queue/wait
+
+presentation queue の `join()` のみを待ちます。action の成功/失敗は判定しません。
+
+### 6. POST /api/queue/wait_strict
+
+presentation queue の消化を待った後、指定 action がすべて `completed` か検査します。1 件でも `failed` / `cancelled` / 未知の `action_id` があれば `false` を返します。
+
+**Request Body**:
+```json
+{
+  "action_ids": ["uuid4"],  // オプション。省略時は直近 N 件を検査
+  "recent_count": 20        // オプション
+}
+```
+
+**Response**:
+```json
+{
+  "status": "ok",
+  "result": true
+}
+```
+
+### 7. POST /api/broadcast/start
 
 配信または録画を開始します。Body サービスが `STREAMING_MODE` 環境変数に基づいて、YouTube Live 配信か OBS 録画かを自動判定します。
 
@@ -111,7 +156,7 @@ Saint Graph から Body への指令送信に使用します。
 }
 ```
 
-### 5. POST /api/broadcast/stop
+### 8. POST /api/broadcast/stop
 
 配信または録画を停止します。
 
@@ -178,6 +223,7 @@ result = await agent.run("東京の明日の天気を教えて")
 | 機能 | 通信方式 | 起動トリガー | 理由 |
 |---|---|---|---|
 | **発話・感情変更** | REST | **プログラム（Parser）** | エラーを許容せず、常に確実に実行するため |
+| **caption / scene / BGM / filler** | REST → presentation queue | **プログラム（Loop）** | 視聴者向けの時系列を worker で一元管理するため |
 | **コメント取得** | REST | **プログラム（Loop）** | 定期的なポーリングが必要なため |
 | **録画・配信制御** | REST | **プログラム（Setup/Teardown）** | システムの開始・終了と同期させるため |
 | **天気予報取得** | MCP | **AI（Autonomous）** | 必要かどうかを AI が判断し、動的に拡張したいため |

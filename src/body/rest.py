@@ -19,6 +19,18 @@ class BodyApp:
     def __init__(self, service: BodyServiceBase):
         self.service = service
 
+    def _ok_result(self, result) -> JSONResponse:
+        """queue 投入系の action_id を REST レスポンスへ展開する。"""
+        if isinstance(result, dict):
+            payload = {
+                "status": "ok",
+                "result": result.get("message", result),
+            }
+            if "action_id" in result:
+                payload["action_id"] = result["action_id"]
+            return JSONResponse(payload)
+        return JSONResponse({"status": "ok", "result": result})
+
     async def health_check(self, request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
@@ -28,8 +40,16 @@ class BodyApp:
             text = body.get("text", "")
             style = body.get("style", "neutral")
             speaker_id = body.get("speaker_id")
-            result = await self.service.speak(text, style, speaker_id)
-            return JSONResponse({"status": "ok", "result": result})
+            caption_title = body.get("caption_title")
+            caption_summary = body.get("caption_summary")
+            result = await self.service.speak(
+                text,
+                style,
+                speaker_id,
+                caption_title=caption_title,
+                caption_summary=caption_summary,
+            )
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in speak API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -39,7 +59,7 @@ class BodyApp:
             body = await request.json()
             emotion = body.get("emotion", "neutral")
             result = await self.service.change_emotion(emotion)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in change_emotion API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -105,6 +125,19 @@ class BodyApp:
             logger.error(f"Error in wait_for_queue API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def wait_for_queue_strict_api(self, request: Request) -> JSONResponse:
+        try:
+            body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+            action_ids = body.get("action_ids")
+            recent_count = body.get("recent_count")
+            if action_ids is not None and not isinstance(action_ids, list):
+                return JSONResponse({"status": "error", "message": "'action_ids' must be a list"}, status_code=400)
+            result = await self.service.wait_for_queue_strict(action_ids, recent_count=recent_count)
+            return JSONResponse({"status": "ok", "result": result})
+        except Exception as e:
+            logger.error(f"Error in wait_for_queue_strict API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     async def bgm_switch_api(self, request: Request) -> JSONResponse:
         """指定 BGM に切替（他のループ系BGMは停止）。SEは触らない。"""
         try:
@@ -113,7 +146,7 @@ class BodyApp:
             if not bgm_id:
                 return JSONResponse({"status": "error", "message": "missing 'bgm_id'"}, status_code=400)
             result = await self.service.switch_bgm(bgm_id)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in bgm/switch API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -127,7 +160,7 @@ class BodyApp:
             if not bgm_id:
                 return JSONResponse({"status": "error", "message": "missing 'bgm_id'"}, status_code=400)
             result = await self.service.play_bgm(bgm_id, restart=restart)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in bgm/play API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -140,7 +173,7 @@ class BodyApp:
             if not bgm_id:
                 return JSONResponse({"status": "error", "message": "missing 'bgm_id'"}, status_code=400)
             result = await self.service.stop_bgm(bgm_id)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in bgm/stop API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -154,7 +187,7 @@ class BodyApp:
             if not category:
                 return JSONResponse({"status": "error", "message": "missing 'category'"}, status_code=400)
             result = await self.service.play_filler(category, style)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in filler/play API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -180,7 +213,7 @@ class BodyApp:
             if not scene_name:
                 return JSONResponse({"status": "error", "message": "missing 'scene'"}, status_code=400)
             result = await self.service.switch_scene(scene_name)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in scene/switch API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -192,7 +225,7 @@ class BodyApp:
             title = body.get("title", "")
             summary = body.get("summary", "")
             result = await self.service.update_news_caption(title, summary)
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in caption/news API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -201,7 +234,7 @@ class BodyApp:
         """OBS のニュースキャプションを空にする。"""
         try:
             result = await self.service.clear_news_caption()
-            return JSONResponse({"status": "ok", "result": result})
+            return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in caption/clear API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -218,6 +251,7 @@ class BodyApp:
             Route("/api/broadcast/start", self.start_broadcast_api, methods=["POST"]),
             Route("/api/broadcast/stop", self.stop_broadcast_api, methods=["POST"]),
             Route("/api/queue/wait", self.wait_for_queue_api, methods=["POST"]),
+            Route("/api/queue/wait_strict", self.wait_for_queue_strict_api, methods=["POST"]),
             Route("/api/bgm/switch", self.bgm_switch_api, methods=["POST"]),
             Route("/api/bgm/play", self.bgm_play_api, methods=["POST"]),
             Route("/api/bgm/stop", self.bgm_stop_api, methods=["POST"]),

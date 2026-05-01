@@ -66,6 +66,9 @@ class SaintGraph:
             tools=all_tools
         )
         self.runner = InMemoryRunner(agent=self.agent)
+        # prefetch 専用の独立 session 連番。本体 session "yt_session" と分離して
+        # Gemini context の混入を防ぐ。
+        self._prefetch_seq = 0
         logger.info(f"SaintGraph initialized with model {MODEL_NAME}, weather_mcp_url={weather_mcp_url}")
 
     async def close(self):
@@ -80,14 +83,48 @@ class SaintGraph:
         await self.process_turn(template, context="Intro")
 
     async def prepare_news_reading_text(self, title: str, content: str) -> List[Tuple[str, str]]:
-        """ニュース読み上げ用のセリフだけを生成し、発話キューには投入しません。"""
+        """ニュース読み上げ用のセリフだけを生成し、発話キューには投入しません。
+
+        メイン session（yt_session）と並行で走ると ADK の session 共有によって
+        Gemini に intro / closing / 他ニュースのコンテキストが混入し、
+        「お兄ちゃんみんな〜...今日はここまで」のような全部入りセリフが返って
+        しまうため、prefetch 専用の独立 session を使う。session_id を都度
+        ユニークにすることで他ターンと完全に分離する。
+        """
         template = self.templates.get("news_reading", "ニュース「{title}」を読み上げます。\n{content}")
         instruction = template.format(title=title, content=content)
-        return await self._collect_turn_sentences(instruction, context=f"News Reading: {title}")
+        self._prefetch_seq += 1
+        prefetch_session_id = f"yt_news_prefetch_{self._prefetch_seq}"
+        return await self._collect_turn_sentences(
+            instruction,
+            context=f"News Reading: {title}",
+            session_id=prefetch_session_id,
+            user_id="yt_news_prefetch_user",
+        )
 
-    async def play_prepared_sentences(self, sentences: List[Tuple[str, str]], wait_after: bool = True):
+    async def play_prepared_sentences(
+        self,
+        sentences: List[Tuple[str, str]],
+        wait_after: bool = True,
+    ) -> Optional[str]:
         """生成済みセリフを Body の発話キューへ投入します。"""
-        await self._play_sentences(sentences, wait_after=wait_after)
+        action_ids = await self._play_sentences(sentences, wait_after=wait_after)
+        return action_ids[0] if action_ids else None
+
+    async def play_prepared_sentences_with_caption(
+        self,
+        sentences: List[Tuple[str, str]],
+        caption_title: str,
+        caption_summary: str,
+        wait_after: bool = False,
+    ) -> List[str]:
+        """生成済みセリフを投入し、最初の speak にニュース caption を同期させます。"""
+        return await self._play_sentences(
+            sentences,
+            wait_after=wait_after,
+            first_caption_title=caption_title,
+            first_caption_summary=caption_summary,
+        )
 
     async def process_news_reading(self, title: str, content: str, wait_after: bool = True):
         """ニュース読み上げを実行します。
@@ -104,9 +141,19 @@ class SaintGraph:
         template = self.templates.get("news_finished", "全てのニュースを読み上げました。")
         await self.process_turn(template, context="News Finished")
 
-    async def process_closing(self):
+    async def process_closing(self, reason: Optional[str] = None):
         """締めの挨拶を実行します。"""
         template = self.templates.get("closing", "それでは、本日の配信を終了します。ありがとうございました。")
+        if reason:
+            reason_instruction = self._closing_reason_instruction(reason)
+            if "{reason}" in template:
+                template = template.format(reason=reason_instruction)
+            else:
+                template = (
+                    f"{template}\n\n"
+                    f"終了理由: {reason_instruction}\n"
+                    "この理由を視聴者に短く自然に伝えてから締めてください。"
+                )
         await self.process_turn(template, context="Closing")
 
     async def process_qa(self):
@@ -164,37 +211,48 @@ class SaintGraph:
 
         await self._play_sentences(sentences, wait_after=wait_after)
 
-    async def _collect_turn_sentences(self, user_input: str, context: Optional[str] = None) -> List[Tuple[str, str]]:
-        """Gemini のイベントストリームを読み、(感情, 文) のリストへ変換します。"""
+    async def _collect_turn_sentences(
+        self,
+        user_input: str,
+        context: Optional[str] = None,
+        session_id: str = "yt_session",
+        user_id: str = "yt_user",
+    ) -> List[Tuple[str, str]]:
+        """Gemini のイベントストリームを読み、(感情, 文) のリストへ変換します。
+
+        session_id / user_id を分けることで、複数ターンを並行に走らせても
+        ADK の session 共有による context 混入を回避できる（prefetch 用途）。
+        既定値は本体メイン session。
+        """
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 # セッションの確保
                 session = await self.runner.session_service.get_session(
-                    app_name=self.runner.app_name, 
-                    user_id="yt_user", 
-                    session_id="yt_session"
+                    app_name=self.runner.app_name,
+                    user_id=user_id,
+                    session_id=session_id
                 )
                 if not session:
                     await self.runner.session_service.create_session(
-                        app_name=self.runner.app_name, 
-                        user_id="yt_user", 
-                        session_id="yt_session"
+                        app_name=self.runner.app_name,
+                        user_id=user_id,
+                        session_id=session_id
                     )
-                
+
                 current_user_message = user_input
                 if context:
                     current_user_message = f"[{context}]\n{user_input}"
-                
+
                 buffered_text = ""
                 current_emotion = "neutral"
                 collected_sentences: List[Tuple[str, str]] = []
 
                 # AIからのテキスト出力をストリーミング的に処理
                 async for event in self.runner.run_async(
-                    new_message=types.Content(role="user", parts=[types.Part(text=current_user_message)]), 
-                    user_id="yt_user", 
-                    session_id="yt_session"
+                    new_message=types.Content(role="user", parts=[types.Part(text=current_user_message)]),
+                    user_id=user_id,
+                    session_id=session_id
                 ):
                     # テキストパートを抽出
                     t = self._extract_text_from_event(event)
@@ -236,19 +294,35 @@ class SaintGraph:
 
         return []
 
-    async def _play_sentences(self, sentences: List[Tuple[str, str]], wait_after: bool = True):
+    async def _play_sentences(
+        self,
+        sentences: List[Tuple[str, str]],
+        wait_after: bool = True,
+        first_caption_title: Optional[str] = None,
+        first_caption_summary: Optional[str] = None,
+    ) -> List[str]:
         """生成済みの文を順に発話キューへ投入します。"""
         sentences_spoken = 0
+        speak_action_ids: List[str] = []
         for emotion, sentence in sentences:
             if not sentence:
                 continue
             await self.body.change_emotion(emotion)
-            await self._speak_sentence(sentence, emotion)
+            caption_title = first_caption_title if sentences_spoken == 0 else None
+            caption_summary = first_caption_summary if sentences_spoken == 0 else None
+            action_id = await self._speak_sentence(
+                sentence,
+                emotion,
+                caption_title=caption_title,
+                caption_summary=caption_summary,
+            )
+            if action_id:
+                speak_action_ids.append(action_id)
             sentences_spoken += 1
 
         if sentences_spoken == 0:
             logger.warning("No text output received from AI.")
-            return
+            return []
 
         if wait_after:
             # このターンで投げた内容を全て話し終えるまで待機（配信のリズム維持のため）
@@ -262,6 +336,8 @@ class SaintGraph:
         else:
             # プリフェッチモード: speak キュー投入まで完了。再生完了は呼び出し側で同期する。
             logger.info(f"Turn queued (prefetch). {sentences_spoken} sentences in queue")
+
+        return speak_action_ids
                 
     def _collect_buffered_sentences(self, buffered_text: str, current_emotion: str, flush: bool = False) -> tuple[str, str, List[Tuple[str, str]]]:
         """
@@ -302,13 +378,35 @@ class SaintGraph:
 
         return buffered_text, current_emotion, collected
 
-    async def _speak_sentence(self, sentence: str, emotion: str):
+    async def _speak_sentence(
+        self,
+        sentence: str,
+        emotion: str,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+    ) -> Optional[str]:
         """1文を発話キューに入れます。"""
         # 単純なタグは除去
         sentence = self._clean_sentence(sentence)
         if sentence:
             logger.debug(f"Streaming sentence to TTS: {sentence[:30]}... (emotion: {emotion})")
-            await self.body.speak(sentence, style=emotion, speaker_id=self.speaker_id)
+            kwargs = {"style": emotion, "speaker_id": self.speaker_id}
+            if caption_title is not None:
+                kwargs["caption_title"] = caption_title
+            if caption_summary is not None:
+                kwargs["caption_summary"] = caption_summary
+            response = await self.body.queue_speak(sentence, **kwargs)
+            if isinstance(response, dict):
+                action_id = response.get("action_id")
+                if isinstance(action_id, str):
+                    return action_id
+        return None
+
+    def _closing_reason_instruction(self, reason: str) -> str:
+        """クロージング生成に渡す終了理由を、人向けの短い指示に変換します。"""
+        if reason == "technical_failure":
+            return "配信システムの技術的不具合のため、このまま配信を続けられません。"
+        return reason
 
     def _clean_sentence(self, sentence: str) -> str:
         """文中に残った単純な感情タグを取り除きます。"""

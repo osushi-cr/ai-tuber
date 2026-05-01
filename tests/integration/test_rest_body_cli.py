@@ -14,13 +14,20 @@ def test_health_check():
 
 def test_speak_api():
     with patch.object(body_service, "speak", new_callable=AsyncMock) as mock_speak:
-        mock_speak.return_value = "Speaking completed"
+        mock_speak.return_value = {"message": "Speaking completed", "action_id": "speak-1"}
         response = client.post("/api/speak", json={"text": "Hello Test", "style": "happy"})
         
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
         assert response.json()["result"] == "Speaking completed"
-        mock_speak.assert_called_once_with("Hello Test", "happy", None)
+        assert response.json()["action_id"] == "speak-1"
+        mock_speak.assert_called_once_with(
+            "Hello Test",
+            "happy",
+            None,
+            caption_title=None,
+            caption_summary=None,
+        )
 
 def test_change_emotion_api():
     with patch.object(body_service, "change_emotion", new_callable=AsyncMock) as mock_change:
