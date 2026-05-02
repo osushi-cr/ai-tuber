@@ -543,6 +543,11 @@ class StreamerBodyService(BodyServiceBase):
 
         recording_disabled = os.getenv("RECORDING_DISABLED", "false").lower() == "true"
 
+        # 視聴者の最初の絵を待機画面にするため、 RTMP 送信開始前に waiting シーンへ切替。
+        waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
+        if await obs_adapter.switch_scene(waiting_scene):
+            await asyncio.sleep(0.5)
+
         try:
             if streaming_mode:
                 result = await self._start_streaming(config)
