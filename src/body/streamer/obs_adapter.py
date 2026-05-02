@@ -467,6 +467,11 @@ async def stop_bgm(bgm_id: str) -> bool:
 _BGM_FADE_DURATION = float(os.getenv("BGM_FADE_DURATION", "1.5"))
 _BGM_FADE_STEPS = max(1, int(os.getenv("BGM_FADE_STEPS", "15")))
 
+# BGM のフェードイン後の最終音量（dB）。 OBS のソース音量と独立してコード側で制御。
+# OBS のソース音量はミキサー絞り、 こちらは「BGM 全体のセリフに対する相対音量」を担当する。
+_BGM_TARGET_DB = float(os.getenv("BGM_TARGET_DB", "-15.0"))
+_BGM_TARGET_MUL = 10 ** (_BGM_TARGET_DB / 20.0)
+
 
 def _set_input_volume_sync(source: str, mul: float) -> None:
     """OBS Input の音量倍率を同期で設定する（mul は 0.0-1.0）。"""
@@ -519,20 +524,23 @@ async def switch_bgm(to_id: str) -> bool:
     except Exception as e:
         logger.warning(f"Failed to restart bgm '{target}': {e}")
 
-    # クロスフェード: 旧 BGM 1→0、 新 BGM 0→1 を並行で
+    # クロスフェード: 旧 BGM target_mul→0、 新 BGM 0→target_mul を並行で
     fade_tasks = [
-        _fade_volume(src, 1.0, 0.0, _BGM_FADE_DURATION)
+        _fade_volume(src, _BGM_TARGET_MUL, 0.0, _BGM_FADE_DURATION)
         for src in fade_out_sources
     ]
-    fade_tasks.append(_fade_volume(target, 0.0, 1.0, _BGM_FADE_DURATION))
+    fade_tasks.append(_fade_volume(target, 0.0, _BGM_TARGET_MUL, _BGM_FADE_DURATION))
     await asyncio.gather(*fade_tasks)
 
-    # フェードアウト完了後、 旧 BGM を非表示にして次回再表示時の音量を 1.0 に戻す
+    # フェードアウト完了後、 旧 BGM を非表示にして次回再表示時の音量を target_mul に戻す
     for src in fade_out_sources:
         await set_source_visibility(src, False)
-        _set_input_volume_sync(src, 1.0)
+        _set_input_volume_sync(src, _BGM_TARGET_MUL)
 
-    logger.info(f"switch_bgm: -> {to_id} (cross-fade {_BGM_FADE_DURATION}s)")
+    logger.info(
+        f"switch_bgm: -> {to_id} (cross-fade {_BGM_FADE_DURATION}s, "
+        f"target {_BGM_TARGET_DB:+.1f}dB / mul={_BGM_TARGET_MUL:.3f})"
+    )
     return True
 
 
