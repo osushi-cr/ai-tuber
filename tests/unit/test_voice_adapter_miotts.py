@@ -36,13 +36,13 @@ def test_style_params_low_arousal_temperatures_unchanged():
 
 
 def test_post_tts_with_retry_passes_through_when_duration_normal(monkeypatch):
-    """通常 duration（0.25 秒/字 程度）なら _post_tts は 1 回しか呼ばれない。"""
+    """通常 duration（0.20 秒/字 程度）なら _post_tts は 1 回しか呼ばれない。"""
     calls = []
 
     def fake_post_tts(text, params):
         calls.append(text)
-        # 38 字なら 10 秒（0.26 秒/字）= 正常範囲
-        return _make_wav(seconds=10.0)
+        # 28 字なら 6 秒（0.21 秒/字）= 正常範囲
+        return _make_wav(seconds=6.0)
 
     monkeypatch.setattr(adapter, "_post_tts", fake_post_tts)
 
@@ -53,7 +53,7 @@ def test_post_tts_with_retry_passes_through_when_duration_normal(monkeypatch):
 
 
 def test_post_tts_with_retry_retries_once_when_runaway_then_recovers(monkeypatch):
-    """暴走 (28 秒 / 38 字 = 0.74 秒/字) → 1 回リトライで正常に戻る。"""
+    """暴走 (28 秒 / 28 字 = 1.0 秒/字) → 1 回リトライで正常に戻る。"""
     durations = [28.0, 6.0]  # 1回目暴走、 2回目正常
 
     def fake_post_tts(text, params):
@@ -68,6 +68,24 @@ def test_post_tts_with_retry_retries_once_when_runaway_then_recovers(monkeypatch
     returned_dur = adapter._wav_duration_from_bytes(result)
     assert returned_dur == pytest.approx(6.0, abs=0.01)
     # durations が両方消費されている = 2 回呼ばれた
+    assert durations == []
+
+
+def test_post_tts_with_retry_catches_borderline_runaway_at_0_4_per_char(monkeypatch):
+    """68 字 / 28 秒 = 0.41 秒/字 のような境界暴走（YouTube Live #2 で実害観測）も
+    閾値 0.35 秒/字でちゃんと拾うこと。"""
+    durations = [28.0, 14.0]  # 1回目: 0.41 秒/字、 2回目: 0.20 秒/字
+
+    def fake_post_tts(text, params):
+        return _make_wav(seconds=durations.pop(0))
+
+    monkeypatch.setattr(adapter, "_post_tts", fake_post_tts)
+
+    text = "あ" * 68  # 68 字
+    result = adapter._post_tts_with_retry(text, {})
+
+    returned_dur = adapter._wav_duration_from_bytes(result)
+    assert returned_dur == pytest.approx(14.0, abs=0.01)
     assert durations == []
 
 

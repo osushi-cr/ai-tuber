@@ -385,8 +385,9 @@ def _post_tts(text: str, params: dict) -> bytes:
 
 # MioTTS-1.7B は temperature が高いと max_tokens まで暴走することがあり、
 # 短文（38字）でも 28秒以上の wav が生成される事例を 2026-05-02 検証で観測。
-# 通常の発話は 0.25〜0.4 秒/字に収まるため、 これを超えたら 1 回だけ再生成する。
-_DURATION_PER_CHAR_LIMIT = float(os.getenv("MIOTTS_DURATION_PER_CHAR_LIMIT", "0.5"))
+# 通常発話は 0.18〜0.24 秒/字、 暴走例は 0.41 秒/字以上になるため、
+# その間の 0.35 秒/字を境界にして 1 回だけ再生成する。
+_DURATION_PER_CHAR_LIMIT = float(os.getenv("MIOTTS_DURATION_PER_CHAR_LIMIT", "0.35"))
 
 
 def _wav_duration_from_bytes(wav_bytes: bytes) -> float:
