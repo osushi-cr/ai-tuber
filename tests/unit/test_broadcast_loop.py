@@ -261,27 +261,27 @@ async def test_handle_news_with_multiple_comments_lists_authors_and_joins_messag
 
 
 @pytest.mark.asyncio
-async def test_handle_news_pauses_auto_filler_during_comment_response():
-    """コメント反応 turn 中は auto_filler_stop を呼んで chitchat 割り込みを止め、
-    完了後に auto_filler_start で再開する（worker queue 詰まり対策）。"""
+async def test_handle_news_does_not_manually_toggle_auto_filler_during_comment_response():
+    """コメント反応 turn では auto_filler_stop/start を手動で呼ばない。
+    text 生成中（queue 空）は filler が出て沈黙感を埋め、 speak 投入後は
+    body-streamer 側の _auto_filler_loop が `queue empty` チェックで自動抑制する。"""
     ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "こんにちは"}])
     await handle_news(ctx)
 
-    # turn 開始時点で auto_filler_stop、 turn 終了で auto_filler_start
-    ctx.saint_graph.body.queue_auto_filler_stop.assert_called()
-    ctx.saint_graph.body.queue_auto_filler_start.assert_called()
+    ctx.saint_graph.body.queue_auto_filler_stop.assert_not_called()
+    ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_handle_news_restarts_auto_filler_even_if_process_turn_raises():
-    """process_turn が例外で死んでも、 auto_filler_start は finally で確実に呼ばれる。"""
+async def test_handle_news_does_not_toggle_auto_filler_even_if_process_turn_raises():
+    """process_turn が例外で死んでも auto_filler は触らない（手動 stop/start なし方針）。"""
     ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "こんにちは"}])
     ctx.saint_graph.process_turn.side_effect = RuntimeError("Gemini failure")
 
     await handle_news(ctx)
 
-    ctx.saint_graph.body.queue_auto_filler_stop.assert_called()
-    ctx.saint_graph.body.queue_auto_filler_start.assert_called()
+    ctx.saint_graph.body.queue_auto_filler_stop.assert_not_called()
+    ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -219,8 +219,11 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
     """
     コメントをポーリングし、あれば応答します。
 
-    反応 turn 中は auto_filler を一時停止して chitchat の割り込みを止め、
-    queue 詰まりによる音声再生遅延を防ぐ。 turn 完了後に auto_filler を再開する。
+    反応 turn の流れは「①コメント作成 (Gemini) → ②音声生成 (MioTTS) → ③音声再生」。
+    ① と ② の間は queue が空 / idle 状態なので auto_filler が「考え中」filler を出し、
+    ③ で speak action が queue に積まれた瞬間に _auto_filler_loop が
+    `if not self._action_queue.empty(): continue` で自動抑制される。
+    手動で auto_filler_stop は呼ばないことで QA 中の沈黙感を解消する。
 
     Returns:
         コメントがあり応答した場合 True
@@ -243,13 +246,6 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
         logger.info(
             f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
         )
-
-        # 反応 turn 中の chitchat 割り込みを止める（queue 詰まりによる音声遅延の解消）。
-        # 失敗しても致命ではない。
-        try:
-            await ctx.saint_graph.body.queue_auto_filler_stop()
-        except Exception as e:
-            logger.warning(f"Failed to stop auto_filler before comment response: {e}")
 
         # コメント反応セリフ生成・再生中はそのコメントを caption に表示し続ける。
         # title=最初の視聴者名（複数なら「ほか N 名」付与）、 summary=本文のみ（連記時は改行）。
@@ -279,11 +275,6 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
                 await ctx.saint_graph.body.set_caption(visible=False)
             except Exception as e:
                 logger.warning(f"Failed to clear comment caption: {e}")
-            # auto_filler を再開（NEWS 内 prefetch 待ちや QA の沈黙埋めに復帰させる）。
-            try:
-                await ctx.saint_graph.body.queue_auto_filler_start()
-            except Exception as e:
-                logger.warning(f"Failed to restart auto_filler after comment response: {e}")
 
         return True
     except Exception as e:
