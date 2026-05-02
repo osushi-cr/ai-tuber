@@ -209,6 +209,26 @@ class BodyClient:
             return data.get("result", "caption updated")
         return "Error: Failed to update caption"
 
+    async def set_content_image(
+        self,
+        image: str = "",
+        visible: bool = True,
+    ) -> str:
+        """OBS ブラウザソース経由で表示する content 画像 overlay を更新する。
+
+        image:
+          - "intro" / "qa" / "end" / ""（非表示）
+        画像本体は data/mind/kurara/assets/contents/{image}.png。
+        """
+        data = await self._request(
+            "POST",
+            "/api/content/set",
+            {"image": image, "visible": visible},
+        )
+        if data:
+            return data.get("result", "content updated")
+        return "Error: Failed to update content image"
+
     async def play_filler(
         self,
         category: Optional[str] = None,

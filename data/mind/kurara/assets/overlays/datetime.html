@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Kurara DateTime Overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+    font-family: "M PLUS Rounded 1c", "Hiragino Maru Gothic ProN", sans-serif;
+  }
+
+  body {
+    display: flex;
+    justify-content: flex-end;
+    padding: 12px 18px;
+    box-sizing: border-box;
+    color: #7A4A2E;
+  }
+
+  #stack {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    border-left: 2px solid #D9A98B;
+    padding-left: 18px;
+  }
+
+  #time {
+    font-size: 56px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.02em;
+  }
+
+  #date {
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+  }
+</style>
+</head>
+<body>
+  <div id="stack">
+    <div id="time"></div>
+    <div id="date"></div>
+  </div>
+
+  <script>
+    const WEEKDAYS_EN = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    const dateEl = document.getElementById("date");
+    const timeEl = document.getElementById("time");
+
+    function pad(n) { return n.toString().padStart(2, "0"); }
+
+    function tick() {
+      const now = new Date();
+      const m = pad(now.getMonth() + 1);
+      const d = pad(now.getDate());
+      const w = WEEKDAYS_EN[now.getDay()];
+      timeEl.textContent = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      dateEl.textContent = `${m}/${d} ${w}`;
+    }
+
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>

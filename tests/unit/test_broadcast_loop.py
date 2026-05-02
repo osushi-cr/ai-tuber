@@ -37,6 +37,7 @@ def _make_ctx(news_service=None, comments=None):
     mock_saint.body.update_news_caption = AsyncMock()
     mock_saint.body.clear_news_caption = AsyncMock()
     mock_saint.body.set_caption = AsyncMock()
+    mock_saint.body.set_content_image = AsyncMock()
     mock_saint.body.play_filler = AsyncMock()
     mock_saint.body.play_bgm = AsyncMock()
     mock_saint.body.stop_bgm = AsyncMock()
@@ -874,3 +875,101 @@ async def test_run_broadcast_loop_detects_startup_caption_clear_failure():
     ctx.saint_graph.register_chitchat.assert_not_called()
     ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
     ctx.saint_graph.body.queue_auto_filler_stop.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# content 画像 overlay（くららの右に intro / qa / end 画像を出す）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_intro_sets_intro_content_image_during_speech():
+    """kurara_main 切替後、 挨拶 speak 投入前に intro 画像を表示する。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+
+    await handle_intro(ctx)
+
+    ctx.saint_graph.body.set_content_image.assert_any_call(image="intro")
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_clears_content_image_before_news_phase():
+    """挨拶完了後、 NEWS フェーズに渡す前に intro 画像を畳む。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+
+    await handle_intro(ctx)
+
+    ctx.saint_graph.body.set_content_image.assert_any_call(visible=False)
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_does_not_set_caption_for_intro_text():
+    """intro テキスト caption は出さず content 画像のみ。 set_caption(type=intro) を呼ばない。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    ctx = _make_ctx(news_service=news_service)
+
+    await handle_intro(ctx)
+
+    intro_caption_calls = [
+        c for c in ctx.saint_graph.body.set_caption.call_args_list
+        if c.kwargs.get("type") == "intro"
+    ]
+    assert intro_caption_calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_sets_qa_content_image_on_first_entry():
+    """QA フェーズ初回入口で qa 画像を表示する。"""
+    ctx = _make_ctx()
+
+    await handle_qa(ctx)
+
+    ctx.saint_graph.body.set_content_image.assert_called_once_with(image="qa")
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_does_not_reset_content_image_on_reentry():
+    """QA は loop で複数回呼ばれるが、 content 画像は初回のみ set。"""
+    ctx = _make_ctx()
+
+    await handle_qa(ctx)
+    await handle_qa(ctx)
+
+    assert ctx.saint_graph.body.set_content_image.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_sets_end_content_image_then_clears_before_ending_scene(monkeypatch, tmp_path):
+    """CLOSING 冒頭で end 画像、 ending scene 切替前に clear する（QA 画像を上書き）。"""
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(tmp_path))
+    ctx = _make_ctx()
+
+    with patch("asyncio.sleep", return_value=None):
+        await handle_closing(ctx)
+
+    calls = ctx.saint_graph.body.set_content_image.call_args_list
+    # 1 回目: end 画像 set / 2 回目: ending 切替前に clear
+    assert calls[0] == call(image="end")
+    assert calls[-1] == call(visible=False)
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_does_not_set_caption_for_closing_text(monkeypatch, tmp_path):
+    """closing テキスト caption は出さず content 画像のみ。 set_caption(type=closing) を呼ばない。"""
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(tmp_path))
+    ctx = _make_ctx()
+
+    with patch("asyncio.sleep", return_value=None):
+        await handle_closing(ctx)
+
+    closing_caption_calls = [
+        c for c in ctx.saint_graph.body.set_caption.call_args_list
+        if c.kwargs.get("type") == "closing"
+    ]
+    assert closing_caption_calls == []

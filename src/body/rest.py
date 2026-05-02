@@ -290,6 +290,30 @@ class BodyApp:
             logger.error(f"Error in caption/set API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+    async def content_state_api(self, request: Request) -> JSONResponse:
+        """現在の content 画像 overlay 状態を返す。 OBS ブラウザソースから 1 秒間隔で fetch される。"""
+        state = self.service.get_content_state()
+        return JSONResponse(
+            state,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def content_set_api(self, request: Request) -> JSONResponse:
+        """content 画像 overlay 状態を更新する（image: intro / qa / end / ""）。"""
+        try:
+            body = await request.json()
+            result = await self.service.set_content(
+                image=body.get("image", ""),
+                visible=body.get("visible", True),
+            )
+            return self._ok_result(result)
+        except Exception as e:
+            logger.error(f"Error in content/set API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
     def get_routes(self) -> list[Route]:
         """共通のルート定義を返します。"""
         return [
@@ -315,4 +339,6 @@ class BodyApp:
             Route("/api/caption/clear", self.caption_clear_api, methods=["POST"]),
             Route("/api/caption/state", self.caption_state_api, methods=["GET"]),
             Route("/api/caption/set", self.caption_set_api, methods=["POST"]),
+            Route("/api/content/state", self.content_state_api, methods=["GET"]),
+            Route("/api/content/set", self.content_set_api, methods=["POST"]),
         ]

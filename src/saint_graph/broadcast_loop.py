@@ -330,15 +330,6 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
 
-    # OP 演出の caption（HTML overlay）
-    try:
-        await ctx.saint_graph.body.set_caption(
-            type="intro",
-            title=os.getenv("BROADCAST_INTRO_CAPTION_TITLE", "くららのAIニュース解説"),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to set intro caption: {e}")
-
     # news1 prefetch をバックグラウンドで仕込む（INTRO テキスト取得と並行）
     if ctx.news_service.has_next():
         first_item = ctx.news_service.peek_current_item()
@@ -371,11 +362,11 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to switch INTRO BGM (op): {e}")
 
-    # waiting 中の intro caption はキャラ画面に切り替わったタイミングで畳む
+    # intro 画像 overlay をくららの右に表示（挨拶中ずっと出す）
     try:
-        await ctx.saint_graph.body.set_caption(visible=False)
+        await ctx.saint_graph.body.set_content_image(image="intro")
     except Exception as e:
-        logger.warning(f"Failed to clear intro caption: {e}")
+        logger.warning(f"Failed to set intro content image: {e}")
 
     # 取得済セリフを TTS + 再生 queue に投入。 worker は kurara_main 切替後に
     # この speak action を処理するため、 kurara_main 画面で挨拶が始まる。
@@ -387,6 +378,12 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
             await ctx.saint_graph.body.wait_for_queue_strict(
                 action_ids=intro_action_ids
             )
+
+    # 挨拶完了。 NEWS フェーズに渡す前に intro 画像を畳む。
+    try:
+        await ctx.saint_graph.body.set_content_image(visible=False)
+    except Exception as e:
+        logger.warning(f"Failed to clear intro content image: {e}")
 
     # auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込みを避ける）。
     # NEWS / QA フェーズの沈黙埋めはここから先で動く。
@@ -514,6 +511,13 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
             return BroadcastPhase.CLOSING
         ctx.phase_scene_initialized.add(BroadcastPhase.QA)
 
+        # QA 画像 overlay をくららの右に表示（QA 中ずっと出す）。
+        # CLOSING に抜ける際は handle_closing 冒頭で end 画像へ上書きされる。
+        try:
+            await ctx.saint_graph.body.set_content_image(image="qa")
+        except Exception as e:
+            logger.warning(f"Failed to set qa content image: {e}")
+
     if await _poll_and_respond(ctx):
         ctx.idle_counter = 0
         return BroadcastPhase.QA
@@ -551,14 +555,12 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     except Exception as e:
         logger.warning(f"Failed to queue auto_filler_stop at CLOSING: {e}")
 
-    # ED 演出の caption（HTML overlay）。 ending シーンに残したまま 60s Holding する。
+    # end 画像 overlay をくららの右に表示（closing pool 再生中のみ。
+    # ending シーン切替直前に clear する）。 QA 画像は上書きされる。
     try:
-        await ctx.saint_graph.body.set_caption(
-            type="closing",
-            title=os.getenv("BROADCAST_CLOSING_CAPTION_TITLE", "おしまい"),
-        )
+        await ctx.saint_graph.body.set_content_image(image="end")
     except Exception as e:
-        logger.warning(f"Failed to set closing caption: {e}")
+        logger.warning(f"Failed to set end content image: {e}")
 
     closings_dir = Path(os.getenv("CLOSING_POOL_DIR", "data/mind/kurara/closings"))
     candidates = (
@@ -587,6 +589,12 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
     else:
         logger.info("Closing pool not found, generating via Gemini")
         await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
+
+    # ending シーン切替前に end 画像 overlay を畳む（ending では画像出さない）。
+    try:
+        await ctx.saint_graph.body.set_content_image(visible=False)
+    except Exception as e:
+        logger.warning(f"Failed to clear end content image: {e}")
 
     # 配信終了画面へシーン切替（ending イラスト＋BGM）
     ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")

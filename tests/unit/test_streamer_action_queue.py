@@ -396,3 +396,33 @@ async def test_wait_for_queue_strict_detects_second_speak_failure(monkeypatch):
         assert svc._task_status[action_ids[1]]["status"] == "failed"
     finally:
         await svc.stop_worker()
+
+
+@pytest.mark.asyncio
+async def test_set_content_updates_state_and_visibility():
+    """set_content() で _content_state が更新され、 image 空のときは visible が強制 False。"""
+    svc = StreamerBodyService()
+
+    initial = svc.get_content_state()
+    assert initial == {"image": "", "visible": False, "updated_at": 0.0}
+
+    await svc.set_content(image="intro")
+    state = svc.get_content_state()
+    assert state["image"] == "intro"
+    assert state["visible"] is True
+    assert state["updated_at"] > 0.0
+
+    await svc.set_content(image="qa")
+    assert svc.get_content_state()["image"] == "qa"
+
+    # visible=False を渡すと image があっても visible False
+    await svc.set_content(image="end", visible=False)
+    assert svc.get_content_state()["visible"] is False
+
+    # image="" は visible 強制 False（クリア用途）
+    await svc.set_content(image="", visible=True)
+    assert svc.get_content_state() == {
+        "image": "",
+        "visible": False,
+        "updated_at": svc.get_content_state()["updated_at"],
+    }

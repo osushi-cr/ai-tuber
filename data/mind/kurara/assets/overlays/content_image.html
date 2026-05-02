@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Kurara Content Image Overlay</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    background: transparent;
+    overflow: hidden;
+  }
+
+  #root {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.35s ease;
+  }
+  #root.shown { opacity: 1; }
+
+  /* くららの右に画像を固定表示する。
+     kurara_main シーンの立ち絵が画面左寄り〜中央なので、画像は右半分に置く。 */
+  .content {
+    position: absolute;
+    right: 4vw;
+    top: 50%;
+    transform: translateY(-50%);
+    max-width: 95vw;
+    max-height: 195vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    filter: drop-shadow(0 8px 24px rgba(0, 0, 0, 0.25));
+  }
+</style>
+</head>
+<body>
+  <div id="root">
+    <img id="content" class="content" alt="">
+  </div>
+
+  <script>
+    const API = (location.search.match(/[?&]api=([^&]+)/) || [])[1]
+      || "http://localhost:8000/api/content/state";
+    const ASSET_BASE = (location.search.match(/[?&]assets=([^&]+)/) || [])[1]
+      || "../contents";
+
+    const root = document.getElementById("root");
+    const imgEl = document.getElementById("content");
+
+    let lastSig = "";
+
+    function render(data) {
+      const sig = JSON.stringify(data);
+      if (sig === lastSig) return;
+      lastSig = sig;
+
+      if (!data || !data.visible || !data.image) {
+        root.classList.remove("shown");
+        return;
+      }
+
+      const newSrc = `${ASSET_BASE}/${data.image}.png`;
+      if (imgEl.getAttribute("src") !== newSrc) {
+        imgEl.setAttribute("src", newSrc);
+      }
+      root.classList.add("shown");
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch(API + "?_t=" + Date.now(), { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        render(data);
+      } catch (e) {
+        // body-streamer が落ちた等は無視（次回ポーリングで自動復帰）
+      }
+    }
+
+    setInterval(poll, 1000);
+    poll();
+  </script>
+</body>
+</html>

@@ -67,6 +67,14 @@ class StreamerBodyService(BodyServiceBase):
             "visible": False,
             "updated_at": 0.0,
         }
+        # OBS ブラウザソースから fetch される現在の content 画像 overlay 状態。
+        # image は "intro" / "qa" / "end" / "" (非表示)。
+        # data/mind/kurara/assets/contents/{image}.png をくららの右に固定表示する。
+        self._content_state: Dict[str, Any] = {
+            "image": "",
+            "visible": False,
+            "updated_at": 0.0,
+        }
 
     async def set_caption(
         self,
@@ -100,6 +108,33 @@ class StreamerBodyService(BodyServiceBase):
     def get_caption_state(self) -> Dict[str, Any]:
         """現在の caption 状態を返す（OBS ブラウザソースのポーリング用）。"""
         return dict(self._caption_state)
+
+    async def set_content(
+        self,
+        image: str = "",
+        visible: bool = True,
+    ) -> str:
+        """OBS ブラウザソース経由で表示する content 画像 overlay 状態を更新する。
+
+        image:
+          - "intro" : INTRO 挨拶中（kurara_main 上にイントロ画像）
+          - "qa"    : QA フェーズ中（コメント拾いコーナー）
+          - "end"   : CLOSING 中（closing pool 再生中）
+          - ""      : 非表示
+        """
+        self._content_state = {
+            "image": image,
+            "visible": visible if image else False,
+            "updated_at": time.time(),
+        }
+        logger.info(
+            f"[content_state] image={image or '(empty)'} visible={self._content_state['visible']}"
+        )
+        return "content updated"
+
+    def get_content_state(self) -> Dict[str, Any]:
+        """現在の content 画像 overlay 状態を返す（OBS ブラウザソースのポーリング用）。"""
+        return dict(self._content_state)
 
     async def inject_comment(self, author: str, message: str) -> str:
         """テスト用にダミーコメントを注入します。次の get_comments() で返ります。"""
@@ -506,11 +541,17 @@ class StreamerBodyService(BodyServiceBase):
         config = config or {}
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
 
+        recording_disabled = os.getenv("RECORDING_DISABLED", "false").lower() == "true"
+
         try:
             if streaming_mode:
                 result = await self._start_streaming(config)
                 # ストリーミング開始後の安定化待機（YouTube側にデータが届き始めるまで数秒待つ）
                 await asyncio.sleep(3)
+            elif recording_disabled:
+                # ローカル E2E 検証用: OBS 録画をスキップして容量を節約する。
+                result = "OBS録画はスキップしました（RECORDING_DISABLED=true）"
+                logger.info("[start_broadcast] Recording disabled by RECORDING_DISABLED=true")
             else:
                 result = await self.start_obs_recording()
                 # OBS録画開始後の安定化待機
@@ -602,10 +643,14 @@ class StreamerBodyService(BodyServiceBase):
         await asyncio.sleep(stop_delay)
 
         streaming_mode = os.getenv("STREAMING_MODE", "false").lower() == "true"
+        recording_disabled = os.getenv("RECORDING_DISABLED", "false").lower() == "true"
 
         try:
             if streaming_mode:
                 return await self._stop_streaming()
+            elif recording_disabled:
+                logger.info("[stop_broadcast] Recording disabled, skipping stop_obs_recording")
+                return "OBS録画はスキップ済み（RECORDING_DISABLED=true）"
             else:
                 return await self.stop_obs_recording()
         except Exception as e:
