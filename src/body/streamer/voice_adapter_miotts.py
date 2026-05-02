@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -341,19 +342,19 @@ _STYLE_PARAMS: dict[str, dict] = {
     },
     "fun": {
         "preset_id": "kurara_joyful",
-        "temperature": 0.9,
+        "temperature": 0.8,
         "top_p": _DEFAULT_TOP_P,
         "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
     },
     "joyful": {
         "preset_id": MIOTTS_PRESET_ID,
-        "temperature": 1.0,
+        "temperature": 0.8,
         "top_p": _DEFAULT_TOP_P,
         "repetition_penalty": 1.2,
     },
     "angry": {
         "preset_id": "kurara_joyful",
-        "temperature": 1.0,
+        "temperature": 0.8,
         "top_p": _DEFAULT_TOP_P,
         "repetition_penalty": _DEFAULT_REPETITION_PENALTY,
     },
@@ -382,6 +383,45 @@ def _post_tts(text: str, params: dict) -> bytes:
         return resp.content
 
 
+# MioTTS-1.7B は temperature が高いと max_tokens まで暴走することがあり、
+# 短文（38字）でも 28秒以上の wav が生成される事例を 2026-05-02 検証で観測。
+# 通常の発話は 0.25〜0.4 秒/字に収まるため、 これを超えたら 1 回だけ再生成する。
+_DURATION_PER_CHAR_LIMIT = float(os.getenv("MIOTTS_DURATION_PER_CHAR_LIMIT", "0.5"))
+
+
+def _wav_duration_from_bytes(wav_bytes: bytes) -> float:
+    """wav バイナリのまま duration を読む（一時ファイル不要）。"""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def _post_tts_with_retry(text: str, params: dict) -> bytes:
+    """生成後 duration が text_len * _DURATION_PER_CHAR_LIMIT を超えたら 1 回だけ再生成する。
+
+    再生成も異常な場合は警告ログのみ残してその wav を返す（無限リトライ防止）。
+    """
+    wav_bytes = _post_tts(text, params)
+    text_len = max(1, len(text))
+    dur = _wav_duration_from_bytes(wav_bytes)
+    ratio = dur / text_len
+    if ratio <= _DURATION_PER_CHAR_LIMIT:
+        return wav_bytes
+
+    logger.warning(
+        f"[synth] runaway detected: dur={dur:.1f}s / len={text_len} = {ratio:.2f}s/char "
+        f"> {_DURATION_PER_CHAR_LIMIT}. Retrying once."
+    )
+    retry_bytes = _post_tts(text, params)
+    retry_dur = _wav_duration_from_bytes(retry_bytes)
+    retry_ratio = retry_dur / text_len
+    if retry_ratio > _DURATION_PER_CHAR_LIMIT:
+        logger.warning(
+            f"[synth] retry still abnormal: dur={retry_dur:.1f}s ratio={retry_ratio:.2f}s/char. "
+            f"Using retry result anyway."
+        )
+    return retry_bytes
+
+
 def _synthesize_sync(text: str, style: str) -> tuple[str, float]:
     # 正規化→分割→送信 の順序を厳密に守る（split時点で絵文字・空白等が残ってると暴走の元）
     normalized = _normalize_text(text)
@@ -393,7 +433,7 @@ def _synthesize_sync(text: str, style: str) -> tuple[str, float]:
     )
 
     if len(sentences) <= 1:
-        wav_bytes = _post_tts(normalized, params)
+        wav_bytes = _post_tts_with_retry(normalized, params)
         filename = f"speech_{abs(hash(text)) % 100000}.wav"
         out_path = VOICE_DIR / filename
         out_path.write_bytes(wav_bytes)
@@ -402,7 +442,7 @@ def _synthesize_sync(text: str, style: str) -> tuple[str, float]:
     # 多文: 各文を順次生成→ wav 結合
     parts: list[Path] = []
     for i, sent in enumerate(sentences):
-        wav_bytes = _post_tts(sent, params)
+        wav_bytes = _post_tts_with_retry(sent, params)
         part_path = VOICE_DIR / f"speech_{abs(hash(text)) % 100000}_part{i}.wav"
         part_path.write_bytes(wav_bytes)
         parts.append(part_path)
