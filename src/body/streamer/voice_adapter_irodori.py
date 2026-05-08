@@ -8,6 +8,8 @@ import wave
 from pathlib import Path
 from typing import Optional
 
+from .voice_normalizer import normalize_text
+
 logger = logging.getLogger(__name__)
 
 IRODORI_CHECKPOINT_REPO = os.getenv("IRODORI_CHECKPOINT_REPO", "Aratako/Irodori-TTS-500M-v2")
@@ -89,6 +91,8 @@ def _estimate_seconds(text: str) -> float:
 def _synthesize_sync(text: str) -> tuple[str, float]:
     from irodori_tts.inference_runtime import SamplingRequest, save_wav
 
+    # 略語カナ化・記号正規化（"GPT-5.5" → "ジーピーティー五点五" 等）。voice_adapter_miotts と共通レイヤー。
+    text = normalize_text(text)
     runtime = _get_runtime()
     seconds = _estimate_seconds(text)
     logger.info(f"[synth] text_len={len(text)} -> seconds={seconds:.1f}")
