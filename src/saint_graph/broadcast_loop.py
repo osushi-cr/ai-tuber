@@ -180,46 +180,40 @@ async def _queue_caption_clear_strict(ctx: BroadcastContext) -> bool:
     )
 
 
-async def _play_news_sentences(
-    ctx: BroadcastContext,
-    sentences: List[Tuple[str, str]],
-    caption_title: str,
-    caption_summary: str,
-) -> bool:
-    """NEWS 入口で scene を retry 付き strict 確認、 speak は retry なしで strict 確認する。
+async def _preload_next_news(ctx: BroadcastContext) -> None:
+    """次のニュースを Gemini 取得→speak action 先行 enqueue まで一気に進める。
 
-    speak は 1 回目で部分再生（音声生成→caption update→play_audio 途中失敗）が起きると
-    retry で同じセリフが再投入されて視聴者には二重発話に聞こえるため、 retry は撤去。
-    失敗時は False を返し、呼び出し側 (handle_news) で CLOSING/technical_failure へフォールバックする。
+    現ニュース再生中に裏で呼ぶことで、body の「speak enqueue 時点で TTS 合成 task 背景開始」
+    機構が活きる。enqueue が早いほど現再生終了時点で次合成が完了している割合が増え、
+    ニュース間の沈黙が縮む。失敗してもループは継続させる（次ループの通常ルートで再試行）。
     """
-    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-    scene_ok = await _queue_scene_switch_strict(
-        ctx, main_scene, "NEWS entry scene_switch"
-    )
-    if not scene_ok:
-        return False
+    if not ctx.news_service.has_next():
+        return
+    next_item = ctx.news_service.peek_current_item()
+    if next_item is None:
+        return
 
+    logger.info(f"Pre-queueing next news during current playback: {next_item.title}")
     try:
-        speak_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
-            sentences,
-            caption_title=caption_title,
-            caption_summary=caption_summary,
+        next_sentences = await ctx.saint_graph.prepare_news_reading_text(
+            title=next_item.title, content=next_item.content
+        )
+        if not next_sentences:
+            logger.warning("next news prefetch returned empty sentences")
+            return
+        next_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
+            next_sentences,
+            caption_title=next_item.title,
+            caption_summary=next_item.content,
             wait_after=False,
         )
-        if not speak_action_ids:
-            logger.warning("NEWS speak did not return action_id")
-            await ctx.saint_graph.body.wait_for_queue()
-            return False
-
-        ok = await ctx.saint_graph.body.wait_for_queue_strict(speak_action_ids)
-        if not ok:
-            logger.warning(
-                "NEWS speak/caption action failed (no retry; falling back to CLOSING)"
-            )
-        return ok
+        if not next_action_ids:
+            logger.warning("next news pre-queue did not return action_ids")
+            return
+        ctx.preloaded_news_action_ids = next_action_ids
+        ctx.preloaded_news_item = next_item
     except Exception as e:
-        logger.warning(f"NEWS speak/caption action error: {e}")
-        return False
+        logger.warning(f"Pre-queue next news failed: {e}")
 
 
 async def _poll_and_respond(ctx: BroadcastContext) -> bool:
@@ -447,8 +441,9 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
 
     ニュースを全消化したら QA へ遷移する。
     """
-    # handle_intro で news1 speak を先行投入済みなら、再生完了待ち + 次 prefetch + filler だけ。
-    # scene/caption は速報投入時に同梱済なので追加処理は不要。
+    # 先行投入済みのニュース（intro または前ループ末尾の _preload_next_news で enqueue 済）が
+    # あれば、それを再生して、再生中に「次の次」を先行 enqueue する。これで全 news が連鎖する。
+    # scene/caption は先行投入時に同梱済なので追加処理は不要。
     if ctx.preloaded_news_action_ids is not None:
         item = ctx.preloaded_news_item
         action_ids = ctx.preloaded_news_action_ids
@@ -460,21 +455,24 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
         # 現ニュースの index を進める（peek 済みアイテムを advance）
         ctx.news_service.get_next_item()
 
-        # 次ニュース prefetch（現再生中に裏で Gemini 生成）
-        if ctx.news_service.has_next():
-            next_item = ctx.news_service.peek_current_item()
-            if next_item:
-                logger.info(f"Prefetching next news: {next_item.title}")
-                ctx.next_news_task = asyncio.create_task(
-                    ctx.saint_graph.prepare_news_reading_text(
-                        title=next_item.title, content=next_item.content
-                    )
-                )
+        # 次ニュースを先行 enqueue（現再生中に裏で Gemini 取得＋ TTS 合成 task が裏で進む）
+        preload_task = asyncio.create_task(_preload_next_news(ctx))
 
         ok = await ctx.saint_graph.body.wait_for_queue_strict(action_ids=action_ids)
         if not ok:
+            preload_task.cancel()
+            try:
+                await preload_task
+            except (asyncio.CancelledError, Exception):
+                pass
             ctx.closing_reason = "technical_failure"
             return BroadcastPhase.CLOSING
+
+        # 並走させた preload を念のため待つ（既に終わっていれば即 return）
+        try:
+            await preload_task
+        except Exception as e:
+            logger.warning(f"Preload task error after current playback: {e}")
 
         try:
             await ctx.saint_graph.body.play_filler("aizuchi")
@@ -527,28 +525,49 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
     # 現ニュースの index を進める
     ctx.news_service.get_next_item()
 
-    # 次ニュースの prefetch を仕込む（現ニュース再生中に並行してセリフ生成）
-    if ctx.news_service.has_next():
-        next_item = ctx.news_service.peek_current_item()
-        if next_item:
-            logger.info(f"Prefetching next news: {next_item.title}")
-            ctx.next_news_task = asyncio.create_task(
-                ctx.saint_graph.prepare_news_reading_text(
-                    title=next_item.title, content=next_item.content
-                )
-            )
-
-    # 現ニュースの caption 同期と音声再生完了を strict に確認する。
-    # caption は最初の speak action 内で更新されるため、speak action_id を監視する。
-    # scene は retry 付き helper で確認、speak は retry なし（部分再生→retry の二重発話を回避）。
-    if not await _play_news_sentences(
-        ctx,
-        sentences,
-        caption_title=item.title,
-        caption_summary=item.content,
-    ):
+    # 現ニュース scene 切替（strict）
+    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+    if not await _queue_scene_switch_strict(ctx, main_scene, "NEWS entry scene_switch"):
         ctx.closing_reason = "technical_failure"
         return BroadcastPhase.CLOSING
+
+    # 現ニュースを speak action queue に enqueue（wait なし）
+    try:
+        current_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
+            sentences,
+            caption_title=item.title,
+            caption_summary=item.content,
+            wait_after=False,
+        )
+        if not current_action_ids:
+            logger.warning("NEWS speak did not return action_id")
+            ctx.closing_reason = "technical_failure"
+            return BroadcastPhase.CLOSING
+    except Exception as e:
+        logger.warning(f"NEWS speak/caption action error: {e}")
+        ctx.closing_reason = "technical_failure"
+        return BroadcastPhase.CLOSING
+
+    # 次ニュースを先行 enqueue（現再生中に裏で Gemini 取得＋ TTS 合成 task が裏で進む）
+    preload_task = asyncio.create_task(_preload_next_news(ctx))
+
+    # 現ニュースの再生完了を strict に確認する（speak は retry なし、部分再生→ retry 二重発話回避）
+    ok = await ctx.saint_graph.body.wait_for_queue_strict(current_action_ids)
+    if not ok:
+        logger.warning("NEWS speak/caption action failed (no retry; falling back to CLOSING)")
+        preload_task.cancel()
+        try:
+            await preload_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        ctx.closing_reason = "technical_failure"
+        return BroadcastPhase.CLOSING
+
+    # 並走させた preload を念のため待つ（既に終わっていれば即 return）
+    try:
+        await preload_task
+    except Exception as e:
+        logger.warning(f"Preload task error after current playback: {e}")
 
     # ニュース完了 → aizuchi 系 filler を 1 個積んで次のセリフ生成中の沈黙を埋める
     try:

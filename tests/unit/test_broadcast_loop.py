@@ -335,17 +335,23 @@ async def test_handle_news_reading():
 
 @pytest.mark.asyncio
 async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
+    """通常ルートで現再生＋次の preload までを spawn することを検証する。
+
+    現再生中に裏で _preload_next_news が走り、次の sentences を Gemini で取得した上で
+    speak action を先行 enqueue（preloaded_news_action_ids にセット）する仕様。
+    """
     async def prepared_current():
         return [("joyful", "現在ニュース")]
 
     news_service = MagicMock()
-    news_service.has_next.side_effect = [True, True]
+    news_service.has_next.return_value = True
     current = MagicMock()
     current.title = "Current"
     current.content = "Current content"
     next_item = MagicMock()
     next_item.title = "Next"
     next_item.content = "Next content"
+    # peek_current_item は通常ルート冒頭で current、_preload_next_news 内で next_item
     news_service.peek_current_item.side_effect = [current, next_item]
     news_service.get_next_item.return_value = current
 
@@ -356,12 +362,19 @@ async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
 
     assert phase == BroadcastPhase.NEWS
     ctx.saint_graph.body.update_news_caption.assert_not_called()
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once_with(
+    # 現と次の 2 つの speak action を投入する
+    assert ctx.saint_graph.play_prepared_sentences_with_caption.call_count == 2
+    ctx.saint_graph.play_prepared_sentences_with_caption.assert_any_call(
         [("joyful", "現在ニュース")],
         caption_title="Current",
         caption_summary="Current content",
         wait_after=False,
     )
+    second_call_kwargs = ctx.saint_graph.play_prepared_sentences_with_caption.call_args_list[1].kwargs
+    assert second_call_kwargs["caption_title"] == "Next"
+    assert second_call_kwargs["caption_summary"] == "Next content"
+    assert second_call_kwargs["wait_after"] is False
+    # scene_switch は現のみ（preload では scene 切替しない）
     ctx.saint_graph.body.queue_scene_switch.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
         call(["scene-action"]),
@@ -369,11 +382,15 @@ async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
     ])
     ctx.saint_graph.body.wait_for_queue.assert_not_called()
     ctx.saint_graph.process_news_reading.assert_not_called()
+    # 次の Gemini prefetch は preload 内で next_item に対して 1 回呼ばれる
     ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
         title="Next", content="Next content"
     )
-    assert ctx.next_news_task is not None
-    await ctx.next_news_task
+    # 次ループ用に preloaded がセットされている
+    assert ctx.preloaded_news_action_ids is not None
+    assert ctx.preloaded_news_item is next_item
+    # 現の prefetch task は消費済み
+    assert ctx.next_news_task is None
 
 
 @pytest.mark.asyncio
