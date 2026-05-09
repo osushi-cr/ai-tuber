@@ -167,6 +167,14 @@ class StreamerBodyService(BodyServiceBase):
         while len(self._task_status) > ACTION_STATUS_MAX:
             self._task_status.popitem(last=False)
 
+    @staticmethod
+    def _public_payload(task: Dict[str, Any]) -> Dict[str, Any]:
+        """task から status 表示用の payload を抽出する（内部 key= `_` prefix を除外）。"""
+        return {
+            k: v for k, v in task.items()
+            if k not in {"action_id", "type"} and not k.startswith("_")
+        }
+
     async def _enqueue_action(
         self,
         task_type: str,
@@ -176,6 +184,15 @@ class StreamerBodyService(BodyServiceBase):
         action_id = str(uuid4())
         task = {"action_id": action_id, "type": task_type, **payload}
         self._remember_task_status(action_id, "pending", task_type, payload)
+        # speak は合成を queue 投入時点で背景で開始する（再生 worker と並行に進む）。
+        # これにより後続 speak の合成が現発話の再生中に裏で完了し、再生間ギャップが縮む。
+        if task_type == "speak":
+            text = payload.get("text", "")
+            style = payload.get("style", "neutral")
+            speaker_id = payload.get("speaker_id")
+            task["_synth_task"] = asyncio.create_task(
+                voice_adapter.generate_and_save(text, style, speaker_id)
+            )
         await self._action_queue.put(task)
         logger.info(f"[{task_type}:queued] action_id={action_id}")
         return {"message": message, "action_id": action_id}
@@ -183,19 +200,17 @@ class StreamerBodyService(BodyServiceBase):
     def _mark_action_running(self, task: Dict[str, Any]) -> None:
         action_id = task["action_id"]
         task_type = task.get("type", "unknown")
-        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
-        self._remember_task_status(action_id, "running", task_type, payload)
+        self._remember_task_status(action_id, "running", task_type, self._public_payload(task))
 
     def _mark_action_completed(self, task: Dict[str, Any]) -> None:
         action_id = task["action_id"]
         task_type = task.get("type", "unknown")
-        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
-        self._remember_task_status(action_id, "completed", task_type, payload)
+        self._remember_task_status(action_id, "completed", task_type, self._public_payload(task))
 
     def _mark_action_failed(self, task: Dict[str, Any], error: BaseException) -> None:
         action_id = task["action_id"]
         task_type = task.get("type", "unknown")
-        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
+        payload = self._public_payload(task)
         error_text = str(error)
         self._remember_task_status(action_id, "failed", task_type, payload, error_text)
         logger.warning(
@@ -205,8 +220,11 @@ class StreamerBodyService(BodyServiceBase):
     def _mark_action_cancelled(self, task: Dict[str, Any]) -> None:
         action_id = task["action_id"]
         task_type = task.get("type", "unknown")
-        payload = {k: v for k, v in task.items() if k not in {"action_id", "type"}}
-        self._remember_task_status(action_id, "cancelled", task_type, payload, "cancelled")
+        # 進行中の合成 task があればここでキャンセルする（リソース解放）
+        synth_task = task.get("_synth_task")
+        if synth_task is not None and not synth_task.done():
+            synth_task.cancel()
+        self._remember_task_status(action_id, "cancelled", task_type, self._public_payload(task), "cancelled")
 
     async def start_worker(self):
         """バックグラウンドワーカーを開始します。"""
@@ -241,6 +259,13 @@ class StreamerBodyService(BodyServiceBase):
                     self._mark_action_cancelled(task)
                     self._action_queue.task_done()
                     task_done_called = True
+                # queue に残っている speak の合成 task もキャンセルしておく
+                while not self._action_queue.empty():
+                    pending = self._action_queue.get_nowait()
+                    pending_synth = pending.get("_synth_task")
+                    if pending_synth is not None and not pending_synth.done():
+                        pending_synth.cancel()
+                    self._action_queue.task_done()
                 break
             except Exception as e:
                 if task is None:
@@ -316,9 +341,14 @@ class StreamerBodyService(BodyServiceBase):
         speaker_id = task.get("speaker_id")
         caption_title = task.get("caption_title")
         caption_summary = task.get("caption_summary")
+        synth_task = task.get("_synth_task")
 
-        # 1. 音声生成（2〜3秒かかる）
-        file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
+        # 1. 音声生成: enqueue 時点で背景開始済みなら結果を待つだけ。後続 speak の合成は
+        #    本タスクの再生中に裏で並行進行し、ニュース内・ニュース間ギャップが縮む。
+        if synth_task is not None:
+            file_path, duration = await synth_task
+        else:
+            file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
 
         # 2. caption 付き speak は、音声生成完了後・再生開始直前に内部 state を更新する。
         #    HTML overlay（OBS ブラウザソース）が /api/caption/state をポーリングして表示する。

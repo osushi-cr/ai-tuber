@@ -1,133 +1,158 @@
-"""Irodori-TTS adapter for speech synthesis (Mac native)."""
+"""Irodori-TTS adapter for speech synthesis (HTTP client to local Irodori-TTS server).
+
+Server は Irodori-TTS の .venv で常駐 (scripts/irodori_tts_server.py)。
+body venv を ML スタックで汚染しないための分離設計。voice_adapter_miotts と同じ流儀。
+
+長文は文単位に分割して順次合成し wav 連結する。Irodori-TTS は seconds=30 で
+固定 latent steps の上限に達して後半が崩壊するため、文単位に分けるのが必須。
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import wave
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from .voice_normalizer import normalize_text
 
 logger = logging.getLogger(__name__)
 
-IRODORI_CHECKPOINT_REPO = os.getenv("IRODORI_CHECKPOINT_REPO", "Aratako/Irodori-TTS-500M-v2")
-IRODORI_REF_WAV = os.getenv(
-    "IRODORI_REF_WAV",
-    str(Path.home() / "src/personal/Irodori-TTS/voice_library/kurara/reference.wav"),
-)
-IRODORI_DEVICE = os.getenv("IRODORI_DEVICE", "mps")
-IRODORI_NUM_STEPS = int(os.getenv("IRODORI_NUM_STEPS", "40"))
-IRODORI_PRECISION = os.getenv("IRODORI_PRECISION", "fp32")
-IRODORI_CODEC_REPO = os.getenv("IRODORI_CODEC_REPO", "Aratako/Semantic-DACVAE-Japanese-32dim")
+IRODORI_API_BASE = os.getenv("IRODORI_API_BASE", "http://localhost:8003")
+IRODORI_TIMEOUT = float(os.getenv("IRODORI_TIMEOUT", "120.0"))
 
 VOICE_DIR = Path(os.getenv("VOICE_DIR", str(Path.home() / ".cache/ai-tuber/voice")))
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
 
-_runtime = None
+# Irodori-TTS は seconds=30 で latent steps 上限に達するため、1 リクエストの上限を
+# 余裕を持たせて 80 字に揃える。短文は前後マージ、長文は読点で再分割。
+_SENTENCE_MAX_CHARS = int(os.getenv("IRODORI_SENTENCE_MAX_CHARS", "80"))
+_SENTENCE_MIN_CHARS = int(os.getenv("IRODORI_SENTENCE_MIN_CHARS", "20"))
 
 
-def _get_runtime():
-    """Lazy-init Irodori-TTS InferenceRuntime singleton (16.7s/utterance after first call)."""
-    global _runtime
-    if _runtime is None:
-        from huggingface_hub import hf_hub_download
-        from irodori_tts.inference_runtime import InferenceRuntime, RuntimeKey
+def _split_sentences(
+    text: str,
+    max_chars: int = _SENTENCE_MAX_CHARS,
+    min_chars: int = _SENTENCE_MIN_CHARS,
+) -> list[str]:
+    """句点で分割し、短文(min_chars未満)はマージ、長文(max_chars超)は読点で再分割する。"""
+    parts = re.split(r"([。！？\n])", text)
+    sentences: list[str] = []
+    buf = ""
+    for part in parts:
+        buf += part
+        if part in "。！？\n":
+            stripped = buf.strip()
+            if stripped:
+                sentences.append(stripped)
+            buf = ""
+    if buf.strip():
+        sentences.append(buf.strip())
 
-        logger.info("Loading Irodori-TTS checkpoint: %s", IRODORI_CHECKPOINT_REPO)
-        checkpoint_path = hf_hub_download(
-            repo_id=IRODORI_CHECKPOINT_REPO,
-            filename="model.safetensors",
-        )
-        _runtime = InferenceRuntime.from_key(
-            RuntimeKey(
-                checkpoint=checkpoint_path,
-                model_device=IRODORI_DEVICE,
-                codec_repo=IRODORI_CODEC_REPO,
-                model_precision=IRODORI_PRECISION,
-                codec_device=IRODORI_DEVICE,
-                codec_precision=IRODORI_PRECISION,
-                codec_deterministic_encode=True,
-                codec_deterministic_decode=True,
-                enable_watermark=False,
-                compile_model=False,
-                compile_dynamic=False,
-            )
-        )
-        logger.info(
-            "Irodori-TTS runtime ready (device=%s precision=%s steps=%d)",
-            IRODORI_DEVICE,
-            IRODORI_PRECISION,
-            IRODORI_NUM_STEPS,
-        )
-    return _runtime
+    merged: list[str] = []
+    for s in sentences:
+        if merged and len(merged[-1]) < min_chars and len(merged[-1]) + len(s) <= max_chars:
+            merged[-1] += s
+        else:
+            merged.append(s)
+
+    result: list[str] = []
+    for s in merged:
+        if len(s) <= max_chars:
+            result.append(s)
+            continue
+        sub_parts = re.split(r"([、])", s)
+        sub_buf = ""
+        for sp in sub_parts:
+            if len(sub_buf) + len(sp) > max_chars and sub_buf:
+                result.append(sub_buf.strip())
+                sub_buf = sp
+            else:
+                sub_buf += sp
+        if sub_buf.strip():
+            result.append(sub_buf.strip())
+
+    final: list[str] = []
+    for s in result:
+        while len(s) > max_chars:
+            final.append(s[:max_chars])
+            s = s[max_chars:]
+        if s.strip():
+            final.append(s.strip())
+    return final
 
 
-def get_wav_duration(file_path: str) -> float:
-    """Return WAV file duration in seconds."""
+def _concat_wavs(parts: list[Path], out_path: Path) -> None:
+    """同一フォーマット前提で wav の frames を連結する。"""
+    if not parts:
+        raise ValueError("no parts to concat")
+    with wave.open(str(parts[0]), "rb") as first:
+        params = first.getparams()
+        frames = [first.readframes(first.getnframes())]
+    for p in parts[1:]:
+        with wave.open(str(p), "rb") as w:
+            if w.getparams()[:3] != params[:3]:
+                logger.warning("wav params mismatch on %s", p)
+            frames.append(w.readframes(w.getnframes()))
+    with wave.open(str(out_path), "wb") as out:
+        out.setparams(params)
+        for f in frames:
+            out.writeframes(f)
+
+
+def _wav_duration(path: str) -> float:
     try:
-        with wave.open(file_path, "rb") as wav:
-            frames = wav.getnframes()
-            rate = wav.getframerate()
-            return frames / float(rate)
+        with wave.open(path, "rb") as wav:
+            return wav.getnframes() / float(wav.getframerate())
     except Exception as e:
-        logger.error("WAV duration error for %s: %s", file_path, e)
+        logger.error("WAV duration error for %s: %s", path, e)
         return 3.0
 
 
-def _estimate_seconds(text: str) -> float:
-    """音声生成に必要な秒数を文字数から推定する。
+def get_wav_duration(file_path: str) -> float:
+    return _wav_duration(file_path)
 
-    日本語の話速はおおむね 1秒 ≒ 4.5 文字。seconds が短いと末尾が不明瞭になる。
-    上限は 30s — Irodori-TTS は訓練時の固定 latent steps を超えると品質が崩れるため
-    （inference_runtime.py の `fixed_target_latent_steps` 警告参照）。30s 以上の
-    発話は呼び出し側でテキストを文単位に分割して順次 speak すること（次セッション課題）。
-    """
-    est = len(text) / 4.5 + 2.0
-    return max(8.0, min(30.0, est))
+
+def _post_tts_sync(text: str) -> dict:
+    with httpx.Client(timeout=IRODORI_TIMEOUT) as client:
+        resp = client.post(f"{IRODORI_API_BASE}/tts", json={"text": text})
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _synthesize_sync(text: str) -> tuple[str, float]:
-    from irodori_tts.inference_runtime import SamplingRequest, save_wav
-
-    # 略語カナ化・記号正規化（"GPT-5.5" → "ジーピーティー五点五" 等）。voice_adapter_miotts と共通レイヤー。
-    text = normalize_text(text)
-    runtime = _get_runtime()
-    seconds = _estimate_seconds(text)
-    logger.info(f"[synth] text_len={len(text)} -> seconds={seconds:.1f}")
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=text,
-            caption=None,
-            ref_wav=IRODORI_REF_WAV,
-            ref_latent=None,
-            no_ref=False,
-            ref_normalize_db=-16.0,
-            ref_ensure_max=True,
-            num_candidates=1,
-            decode_mode="sequential",
-            seconds=seconds,
-            max_ref_seconds=30.0,
-            num_steps=IRODORI_NUM_STEPS,
-            cfg_scale_text=3.0,
-            cfg_scale_caption=3.0,
-            cfg_scale_speaker=5.0,
-            cfg_guidance_mode="independent",
-            cfg_min_t=0.5,
-            cfg_max_t=1.0,
-            context_kv_cache=True,
-            trim_tail=True,
-            tail_window_size=20,
-            tail_std_threshold=0.05,
-            tail_mean_threshold=0.1,
-        ),
-        log_fn=None,
+    normalized = normalize_text(text)
+    sentences = _split_sentences(normalized)
+    logger.info(
+        "[synth] text_len=%d->%d sentences=%d",
+        len(text), len(normalized), len(sentences),
     )
-    filename = f"speech_{abs(hash(text)) % 100000}.wav"
-    out_path = VOICE_DIR / filename
-    saved_path = save_wav(str(out_path), result.audio, result.sample_rate)
-    return str(saved_path), get_wav_duration(str(saved_path))
+
+    base_hash = abs(hash(text)) % 100000
+
+    if len(sentences) <= 1:
+        data = _post_tts_sync(normalized)
+        return data["audio_path"], float(data.get("duration") or _wav_duration(data["audio_path"]))
+
+    parts: list[Path] = []
+    for i, sent in enumerate(sentences):
+        data = _post_tts_sync(sent)
+        # server が保存した path をそのまま使うと並走時に上書きされうるので
+        # part 用にコピーリネームして安定化する
+        src = Path(data["audio_path"])
+        part_path = VOICE_DIR / f"speech_{base_hash}_part{i}.wav"
+        if src != part_path:
+            part_path.write_bytes(src.read_bytes())
+        parts.append(part_path)
+        logger.info("[synth:part %d/%d] len=%d -> %s", i + 1, len(sentences), len(sent), part_path.name)
+
+    out_path = VOICE_DIR / f"speech_{base_hash}.wav"
+    _concat_wavs(parts, out_path)
+    return str(out_path), _wav_duration(str(out_path))
 
 
 async def generate_and_save(
@@ -135,11 +160,10 @@ async def generate_and_save(
     style: str = "neutral",
     speaker_id: Optional[int] = None,
 ) -> tuple[str, float]:
-    """Generate speech via Irodori-TTS and save to VOICE_DIR.
+    """Generate speech via Irodori-TTS HTTP server and return (path, duration).
 
-    Mirrors the VoiceVox voice_adapter I/F. style/speaker_id are accepted for
-    compatibility but currently unused — multi-style synthesis requires per-emotion
-    reference wavs which are not yet recorded.
+    style/speaker_id は VoiceVox adapter と I/F 互換のため受け取るが現状未使用。
+    多感情合成は per-emotion ref-wav を別途録音してから対応する。
     """
     logger.info("Generating speech: '%s' (style=%s)", text, style)
     return await asyncio.to_thread(_synthesize_sync, text)

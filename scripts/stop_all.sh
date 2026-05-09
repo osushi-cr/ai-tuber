@@ -23,10 +23,11 @@ stop_by_pattern() {
     fi
 }
 
-echo "Stopping 3 backend processes..."
+echo "Stopping backend processes..."
 stop_by_pattern 'uvicorn body.streamer.main' 'body-streamer'
 stop_by_pattern 'run_server.py.*--llm-base-url' 'run_server.py'
 stop_by_pattern 'llama-server -m.*MioTTS' 'llama-server'
+stop_by_pattern 'irodori_tts_server\.py' 'irodori-tts-server'
 
 # saint_graph も併せて止める（残ってれば）
 # `-m saint_graph.main` だと pgrep が -m をオプション解釈するため、頭の `-` を避ける
@@ -36,7 +37,7 @@ sleep 2
 
 echo ""
 echo "=== Status ==="
-for port in 8002 8001 8000; do
+for port in 8002 8001 8003 8000; do
     if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "  ⚠️  :${port} still listening"
     else

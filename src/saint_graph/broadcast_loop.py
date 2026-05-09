@@ -35,6 +35,10 @@ class BroadcastContext:
     idle_counter: int = 0
     # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
     next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
+    # handle_intro で news1 を speak まで先回り投入したときの action_ids と原ニュース。
+    # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
+    preloaded_news_action_ids: Optional[List[str]] = None
+    preloaded_news_item: Optional[Any] = None
     closing_reason: Optional[str] = None
     phase_scene_initialized: set[BroadcastPhase] = field(default_factory=set)
 
@@ -336,6 +340,18 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
     # ここが重い処理（Gemini API + retry）なので chitchat BGM で見せる。
     intro_sentences = await ctx.saint_graph.prepare_intro_text()
 
+    # news1 prefetch も完了するまで waiting で待つ（演出時間の確保）。
+    # gemini-3.1-flash-lite は intro/news が両方とも数秒で返るため、待たないと waiting
+    # シーンの chitchat BGM が一瞬で終わってしまう。最大 15s で打ち切り、間に合わなければ
+    # NEWS フェーズで通常の prefetch 待ちに任せる。
+    if ctx.next_news_task is not None and not ctx.next_news_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(ctx.next_news_task), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.info("news1 prefetch did not finish within waiting window (15s); proceeding")
+        except Exception as e:
+            logger.warning(f"news1 prefetch errored during waiting wait: {e}")
+
     # kurara_main へ strict 切替（挨拶はキャラ画面で流す）
     main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
     ok = await _queue_scene_switch_strict(
@@ -365,6 +381,30 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
         intro_action_ids = await ctx.saint_graph.play_prepared_sentences(
             intro_sentences, wait_after=False
         )
+
+        # news1 voice 先回り投入: intro 再生中に news1 の合成を裏で進める。
+        # body の改修🅐 で speak は enqueue 時点で合成 task が背景開始するため、
+        # intro 再生終了時には news1 合成が完了済 → ギャップなしで news1 が始まる。
+        news1_item = ctx.news_service.peek_current_item()
+        if news1_item is not None and ctx.next_news_task is not None:
+            try:
+                news1_sentences = await ctx.next_news_task
+            except Exception as e:
+                logger.warning(f"news1 prefetch failed during intro queueing: {e}")
+                news1_sentences = None
+            ctx.next_news_task = None
+
+            if news1_sentences:
+                logger.info(f"Pre-queueing news1 speak during intro: {news1_item.title}")
+                news1_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
+                    news1_sentences,
+                    caption_title=news1_item.title,
+                    caption_summary=news1_item.content,
+                    wait_after=False,
+                )
+                ctx.preloaded_news_action_ids = news1_action_ids
+                ctx.preloaded_news_item = news1_item
+
         if intro_action_ids:
             await ctx.saint_graph.body.wait_for_queue_strict(
                 action_ids=intro_action_ids
@@ -404,6 +444,42 @@ async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
 
     ニュースを全消化したら QA へ遷移する。
     """
+    # handle_intro で news1 speak を先行投入済みなら、再生完了待ち + 次 prefetch + filler だけ。
+    # scene/caption は速報投入時に同梱済なので追加処理は不要。
+    if ctx.preloaded_news_action_ids is not None:
+        item = ctx.preloaded_news_item
+        action_ids = ctx.preloaded_news_action_ids
+        ctx.preloaded_news_action_ids = None
+        ctx.preloaded_news_item = None
+
+        logger.info(f"Reading pre-queued news: {item.title if item else '(unknown)'}")
+
+        # 現ニュースの index を進める（peek 済みアイテムを advance）
+        ctx.news_service.get_next_item()
+
+        # 次ニュース prefetch（現再生中に裏で Gemini 生成）
+        if ctx.news_service.has_next():
+            next_item = ctx.news_service.peek_current_item()
+            if next_item:
+                logger.info(f"Prefetching next news: {next_item.title}")
+                ctx.next_news_task = asyncio.create_task(
+                    ctx.saint_graph.prepare_news_reading_text(
+                        title=next_item.title, content=next_item.content
+                    )
+                )
+
+        ok = await ctx.saint_graph.body.wait_for_queue_strict(action_ids=action_ids)
+        if not ok:
+            ctx.closing_reason = "technical_failure"
+            return BroadcastPhase.CLOSING
+
+        try:
+            await ctx.saint_graph.body.play_filler("aizuchi")
+        except Exception as e:
+            logger.warning(f"Failed to queue filler between news items: {e}")
+
+        return BroadcastPhase.NEWS
+
     # ニュース全消化 → QA（コメント拾いコーナー）へ
     if not ctx.news_service.has_next():
         logger.info("All news items read. Moving to QA (comment corner).")
