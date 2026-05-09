@@ -407,6 +407,15 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
                 action_ids=intro_action_ids
             )
 
+    # intro speak 完了後、news1 (preloaded) 再生が始まる直前に BGM を news に切替える。
+    # run_broadcast_loop の自動切替（next_phase 検知時）だと news1 再生開始後になり、
+    # 視聴者は news1 を op BGM のまま聞いてしまう。INTRO で waiting=chitchat→kurara_main=op を
+    # 動的切替してるのと同じ理屈で、INTRO の責務として news 突入直前に BGM を移行させる。
+    try:
+        await ctx.saint_graph.body.switch_bgm("news")
+    except Exception as e:
+        logger.warning(f"Failed to switch INTRO->NEWS BGM (news): {e}")
+
     # 挨拶完了。 NEWS フェーズに渡す前に intro 画像を畳む。
     try:
         await ctx.saint_graph.body.set_content_image(visible=False)
@@ -730,9 +739,10 @@ _HANDLERS = {
 # フェーズと BGM の対応。 obs_adapter.BGM_SOURCES の bgm_id と一致させる。
 _PHASE_BGM = {
     # INTRO は handle_intro 内で waiting=chitchat → kurara_main=op を動的切替するため None。
-    # run_broadcast_loop 冒頭の自動 BGM 切替はスキップさせる。
+    # NEWS は handle_intro 末尾で news1 再生開始直前に動的切替するため None（自動切替を待つと
+    # news1 が op BGM のまま再生される事故になる）。
     BroadcastPhase.INTRO:   None,
-    BroadcastPhase.NEWS:    "news",
+    BroadcastPhase.NEWS:    None,
     BroadcastPhase.QA:      "chitchat",
     BroadcastPhase.CLOSING: "ed",
 }
