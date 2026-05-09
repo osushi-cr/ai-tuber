@@ -39,6 +39,9 @@ class BroadcastContext:
     # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
     preloaded_news_action_ids: Optional[List[str]] = None
     preloaded_news_item: Optional[Any] = None
+    # QA フェーズでの発話回数。qa（コメント促進）と qa_chitchat（自発雑談）を 1:2 で
+    # 交互ローテーションするためのカウンタ。
+    qa_speak_counter: int = 0
     closing_reason: Optional[str] = None
     phase_scene_initialized: set[BroadcastPhase] = field(default_factory=set)
 
@@ -596,12 +599,24 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
         )
         return BroadcastPhase.CLOSING
 
-    # 一定サイクル毎に促進セリフ
+    # 一定サイクル毎に発話。3 回中 1 回はコメント促進（qa）、残り 2 回は自発雑談（qa_chitchat）。
+    # 雑談優位にすることで「コメント来てね」連発の単調さを避け、配信が自然に流れる。
     if ctx.idle_counter % _QA_PROMPT_EVERY == 1:
-        try:
-            await ctx.saint_graph.process_qa()
-        except Exception as e:
-            logger.warning(f"Failed to run QA prompt: {e}")
+        ctx.qa_speak_counter += 1
+        if ctx.qa_speak_counter % 3 == 0:
+            try:
+                await ctx.saint_graph.process_qa()
+            except Exception as e:
+                logger.warning(f"Failed to run QA prompt: {e}")
+        else:
+            recent_titles = (
+                [item.title for item in ctx.news_service.items[-3:]]
+                if getattr(ctx.news_service, "items", None) else None
+            )
+            try:
+                await ctx.saint_graph.process_qa_chitchat(recent_titles=recent_titles)
+            except Exception as e:
+                logger.warning(f"Failed to run QA chitchat: {e}")
 
     return BroadcastPhase.QA
 

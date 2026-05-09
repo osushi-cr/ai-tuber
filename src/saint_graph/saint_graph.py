@@ -178,6 +178,21 @@ class SaintGraph:
         template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
         await self.process_turn(template, context="QA")
 
+    async def process_qa_chitchat(self, recent_titles: Optional[List[str]] = None):
+        """QA 中の自発雑談：コメントが来ていない時間に独り言／呼びかけ／振り返りを喋る。
+
+        recent_titles を渡すとニュース振り返りトピックの素材として Gemini に提示される。
+        """
+        template = self.templates.get(
+            "qa_chitchat", "今日もみんなと話せて、くらら嬉しいな"
+        )
+        if recent_titles:
+            tail = recent_titles[-3:]
+            context = "QA chitchat. 直前に読んだニュース: " + " / ".join(tail)
+        else:
+            context = "QA chitchat"
+        await self.process_turn(template, context=context)
+
     # 沈黙埋め用の定数雑談セリフ（Gemini 不要・即動作）。voice_adapter で
     # 正規化されるので絵文字・英字は使わず、10-25字の短文で揃える。
     _CHITCHAT_LINES = [

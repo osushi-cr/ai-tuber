@@ -21,7 +21,7 @@ async def main():
     system_instruction = loader.load_system_instruction()
     
     template_names = [
-        "intro", "news_reading", "news_finished", "closing", "qa"
+        "intro", "news_reading", "news_finished", "closing", "qa", "qa_chitchat"
     ]
     templates = loader.load_templates(template_names)
 
