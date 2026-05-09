@@ -229,11 +229,7 @@ def normalize_text(text: str) -> str:
     for abbrev, kana in _COMMON_ABBREVS_SORTED:
         text = text.replace(abbrev, kana)
     text = _normalize_numbers_and_symbols(text)
-    # COMMON_ABBREVS にヒットしなかった連続英字は削除する。アルファベット読みに展開すると
-    # "Superlative" → "エスユーピーイーアールエル..." のように一般英単語までスペル読みされて
-    # 視聴者には読み間違いに聞こえるため。原稿生成側（Gemini）で英語タイトル・固有名詞を
-    # カタカナ表記する規約を持たせ、漏れた英字はサイレントに落とすセーフティネット運用。
-    text = re.sub(r"[A-Za-z]+", "", text)
-    # 英字削除で空になった鉤括弧ペアを除去（"より「」、" のような不自然な並びがTTSで暴走/崩壊するため）
-    text = re.sub(r"「」|『』|\(\)|（）|【】|《》|〈〉", "", text)
+    # COMMON_ABBREVS にヒットしなかった連続英字はそのまま flow matching に渡す。
+    # 削除すると単語抜けで文意が失われるが、そのまま渡せば（崩壊しても）位置と存在は伝わり、
+    # 辞書漏れの検知（耳判定での違和感）も容易になる。
     return text
