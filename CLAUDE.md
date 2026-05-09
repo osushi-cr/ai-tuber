@@ -47,7 +47,7 @@
 
 ▼ 中の人について
 ・お寿司（@osushi_cr）が個人開発で動かしてる AITuber
-・声は MioTTS-1.7B（Apple Silicon ローカル合成）
+・声は Irodori-TTS（500M、Apple Silicon ローカル合成）
 ・LLM は Gemini 3.1 Flash Lite Preview
 ・配信制御・ニュース選定はスクリプトで自動化
 
