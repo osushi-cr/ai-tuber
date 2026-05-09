@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -97,10 +98,47 @@ def _load_runtime() -> InferenceRuntime:
     return runtime
 
 
+def _prewarm(runtime: InferenceRuntime) -> None:
+    """初回 synth は MPS Metal グラフコンパイルで数秒重い。起動時に 1 発打って吸収する。"""
+    t0 = time.perf_counter()
+    runtime.synthesize(
+        SamplingRequest(
+            text="ウォームアップ。",
+            caption=None,
+            ref_wav=REF_WAV,
+            ref_latent=None,
+            no_ref=False,
+            ref_normalize_db=-16.0,
+            ref_ensure_max=True,
+            num_candidates=1,
+            decode_mode="sequential",
+            seconds=8.0,
+            max_ref_seconds=30.0,
+            num_steps=NUM_STEPS,
+            t_schedule_mode=T_SCHEDULE_MODE,
+            sway_coeff=SWAY_COEFF,
+            cfg_scale_text=3.0,
+            cfg_scale_caption=3.0,
+            cfg_scale_speaker=5.0,
+            cfg_guidance_mode="independent",
+            cfg_min_t=0.5,
+            cfg_max_t=1.0,
+            context_kv_cache=True,
+            trim_tail=True,
+            tail_window_size=20,
+            tail_std_threshold=0.05,
+            tail_mean_threshold=0.1,
+        ),
+        log_fn=None,
+    )
+    logger.info("Prewarm done in %.2fs", time.perf_counter() - t0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _runtime
     _runtime = _load_runtime()
+    _prewarm(_runtime)
     yield
     _runtime = None
 
@@ -119,9 +157,9 @@ class TTSResponse(BaseModel):
 
 
 def _estimate_seconds(text: str) -> float:
-    """日本語 1 秒 ≒ 4.5 文字。30s 上限は訓練 latent steps の都合（呼び出し側で文分割すべき）。"""
-    est = len(text) / 4.5 + 2.0
-    return max(8.0, min(30.0, est))
+    """日本語 1 秒 ≒ 4.5 文字。マージン 1.0s は trim_tail で末尾を整えるための余白。上限 30s は訓練 latent steps 制約。"""
+    est = len(text) / 4.5 + 1.0
+    return max(4.0, min(30.0, est))
 
 
 def _wav_duration(path: str) -> float:
