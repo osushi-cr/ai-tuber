@@ -39,6 +39,9 @@ class BroadcastContext:
     # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
     preloaded_news_action_ids: Optional[List[str]] = None
     preloaded_news_item: Optional[Any] = None
+    # 最後のニュース再生中に裏で先回り投入した QA 初手 chitchat の action_ids。
+    # handle_qa 冒頭でこれを検知して再生完了待ち＋通常ループ復帰する。news → QA 遷移の沈黙短縮用。
+    preloaded_qa_action_ids: Optional[List[str]] = None
     # QA フェーズでの発話回数。qa（コメント促進）と qa_chitchat（自発雑談）を 1:2 で
     # 交互ローテーションするためのカウンタ。
     qa_speak_counter: int = 0
@@ -180,14 +183,47 @@ async def _queue_caption_clear_strict(ctx: BroadcastContext) -> bool:
     )
 
 
+async def _preload_first_qa_chitchat(ctx: BroadcastContext) -> None:
+    """最後のニュース再生中に QA 初手 chitchat を裏で Gemini 取得→ enqueue する。
+
+    最後の news 再生中は `_preload_next_news` の「次ニュース」対象が無いため、その
+    タイミングで代わりに QA 初手の振り返り chitchat を先行投入する。handle_qa 冒頭で
+    `ctx.preloaded_qa_action_ids` を検知して再生→クリア。news → QA 遷移の沈黙を縮める。
+    """
+    if ctx.preloaded_qa_action_ids is not None:
+        return
+    recent_titles = [item.title for item in ctx.news_service.items]
+    logger.info("Pre-queueing QA first chitchat during last news playback")
+    try:
+        sentences = await ctx.saint_graph.prepare_qa_chitchat_text(
+            recent_titles=recent_titles
+        )
+        if not sentences:
+            logger.warning("QA first chitchat prefetch returned empty sentences")
+            return
+        action_ids = await ctx.saint_graph.play_prepared_sentences(
+            sentences, wait_after=False
+        )
+        if not action_ids:
+            logger.warning("QA first chitchat pre-queue did not return action_ids")
+            return
+        ctx.preloaded_qa_action_ids = action_ids
+    except Exception as e:
+        logger.warning(f"Pre-queue QA first chitchat failed: {e}")
+
+
 async def _preload_next_news(ctx: BroadcastContext) -> None:
     """次のニュースを Gemini 取得→speak action 先行 enqueue まで一気に進める。
 
     現ニュース再生中に裏で呼ぶことで、body の「speak enqueue 時点で TTS 合成 task 背景開始」
     機構が活きる。enqueue が早いほど現再生終了時点で次合成が完了している割合が増え、
     ニュース間の沈黙が縮む。失敗してもループは継続させる（次ループの通常ルートで再試行）。
+
+    最後のニュース再生中で次ニュースが無い場合は、代わりに QA 初手 chitchat を裏で
+    Gemini 取得→ enqueue して news → QA 遷移の沈黙を埋める。
     """
     if not ctx.news_service.has_next():
+        await _preload_first_qa_chitchat(ctx)
         return
     next_item = ctx.news_service.peek_current_item()
     if next_item is None:
@@ -615,6 +651,19 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
             await ctx.saint_graph.body.set_content_image(image="qa")
         except Exception as e:
             logger.warning(f"Failed to set qa content image: {e}")
+
+    # 最後の news 再生中に裏で先回り投入した QA 初手 chitchat があれば、それを再生する。
+    # 通常の poll/promote ループに入る前に消化して news → QA 遷移の沈黙を埋める。
+    if ctx.preloaded_qa_action_ids is not None:
+        action_ids = ctx.preloaded_qa_action_ids
+        ctx.preloaded_qa_action_ids = None
+        logger.info("Reading pre-queued QA first chitchat")
+        ok = await ctx.saint_graph.body.wait_for_queue_strict(action_ids=action_ids)
+        if not ok:
+            logger.warning("Pre-queued QA chitchat playback did not complete cleanly")
+        ctx.idle_counter = 0
+        ctx.qa_speak_counter += 1
+        return BroadcastPhase.QA
 
     if await _poll_and_respond(ctx):
         ctx.idle_counter = 0

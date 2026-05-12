@@ -178,6 +178,32 @@ class SaintGraph:
         template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
         await self.process_turn(template, context="QA")
 
+    async def prepare_qa_chitchat_text(
+        self, recent_titles: Optional[List[str]] = None
+    ) -> List[Tuple[str, str]]:
+        """QA 初手 chitchat 用のセリフだけを生成し、発話キューには投入しません。
+
+        最後のニュース再生中に裏で先回り発火し、`handle_qa` 冒頭で preloaded ルートから
+        再生する用途。prepare_news_reading_text と同じく専用 session_id を使い、
+        メイン session への context 混入を防ぐ。
+        """
+        template = self.templates.get(
+            "qa_chitchat", "今日もみんなと話せて、くらら嬉しいな"
+        )
+        if recent_titles:
+            tail = recent_titles[-3:]
+            context = "QA chitchat. 直前に読んだニュース: " + " / ".join(tail)
+        else:
+            context = "QA chitchat"
+        self._prefetch_seq += 1
+        prefetch_session_id = f"yt_qa_prefetch_{self._prefetch_seq}"
+        return await self._collect_turn_sentences(
+            template,
+            context=context,
+            session_id=prefetch_session_id,
+            user_id="yt_qa_prefetch_user",
+        )
+
     async def process_qa_chitchat(self, recent_titles: Optional[List[str]] = None):
         """QA 中の自発雑談：コメントが来ていない時間に独り言／呼びかけ／振り返りを喋る。
 

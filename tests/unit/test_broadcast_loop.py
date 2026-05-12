@@ -13,6 +13,7 @@ from saint_graph.broadcast_loop import (
     handle_qa,
     handle_closing,
     run_broadcast_loop,
+    _preload_next_news,
 )
 from saint_graph.config import MAX_WAIT_CYCLES
 
@@ -990,3 +991,64 @@ async def test_handle_closing_does_not_set_caption_for_closing_text(monkeypatch,
         if c.kwargs.get("type") == "closing"
     ]
     assert closing_caption_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preload_next_news_falls_back_to_qa_chitchat_on_last_news():
+    """最後の news 再生中（has_next=False）は QA 初手 chitchat を裏で先行投入する。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    item1 = MagicMock(); item1.title = "T1"
+    item2 = MagicMock(); item2.title = "T2"
+    news_service.items = [item1, item2]
+    ctx = _make_ctx(news_service=news_service)
+    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
+        return_value=[("neutral", "今日のニュース振り返り")]
+    )
+    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["qa-speak"])
+
+    await _preload_next_news(ctx)
+
+    ctx.saint_graph.prepare_qa_chitchat_text.assert_called_once_with(
+        recent_titles=["T1", "T2"]
+    )
+    ctx.saint_graph.play_prepared_sentences.assert_called_once()
+    assert ctx.preloaded_qa_action_ids == ["qa-speak"]
+    # 通常の news prefetch 経路は呼ばれない
+    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preload_next_news_skips_qa_chitchat_when_already_preloaded():
+    """同じ has_next=False 状況で二度呼ばれても QA chitchat の二重投入は起きない。"""
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    news_service.items = []
+    ctx = _make_ctx(news_service=news_service)
+    ctx.preloaded_qa_action_ids = ["existing"]
+    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(return_value=[("neutral", "x")])
+    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["another"])
+
+    await _preload_next_news(ctx)
+
+    ctx.saint_graph.prepare_qa_chitchat_text.assert_not_called()
+    assert ctx.preloaded_qa_action_ids == ["existing"]
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_consumes_preloaded_chitchat():
+    """preloaded_qa_action_ids があれば handle_qa 冒頭で消化して QA フェーズに残る。"""
+    ctx = _make_ctx()
+    ctx.preloaded_qa_action_ids = ["id1", "id2"]
+    ctx.idle_counter = 5
+    ctx.qa_speak_counter = 0
+
+    phase = await handle_qa(ctx)
+
+    assert phase == BroadcastPhase.QA
+    assert ctx.preloaded_qa_action_ids is None
+    assert ctx.idle_counter == 0
+    assert ctx.qa_speak_counter == 1
+    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(action_ids=["id1", "id2"])
+    # poll/promote 系統は走らない（preloaded ルートで早期 return）
+    ctx.saint_graph.body.get_comments.assert_not_called()
