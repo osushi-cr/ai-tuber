@@ -1,6 +1,6 @@
 {
     "voice_engine": "irodori",
-    "checkpoint_repo": "Aratako/Irodori-TTS-500M-v2",
+    "checkpoint_repo": "Aratako/Irodori-TTS-500M-v3",
     "ref_wav": "voice_library/kurara/reference.wav",
     "default_style": "neutral",
     "num_steps": 40,

@@ -17,7 +17,7 @@ data/mind/kurara/
 
 `mind.json` の `voice_engine: "irodori"` により Irodori-TTS で音声合成します。
 
-- **checkpoint**: `Aratako/Irodori-TTS-500M-v2` (HuggingFace)
+- **checkpoint**: `Aratako/Irodori-TTS-500M-v3` (HuggingFace)
 - **ref_wav**: `~/src/personal/Irodori-TTS/voice_library/kurara/reference.wav`
 - **device**: Mac MPS / fp32 / 16.7s/発話（モデル常駐前提）
 
