@@ -10,7 +10,7 @@ body venv を ML スタックで汚染せずに済むよう、本ファイルは
 設定（環境変数、voice_adapter_irodori.py と同じ既定値）:
     IRODORI_HOST          default 127.0.0.1
     IRODORI_PORT          default 8003
-    IRODORI_CHECKPOINT_REPO   default Aratako/Irodori-TTS-500M-v2
+    IRODORI_CHECKPOINT_REPO   default Aratako/Irodori-TTS-500M-v3
     IRODORI_CODEC_REPO    default Aratako/Semantic-DACVAE-Japanese-32dim
     IRODORI_REF_WAV       default ~/src/personal/Irodori-TTS/voice_library/kurara/reference.wav
     IRODORI_DEVICE        default mps
