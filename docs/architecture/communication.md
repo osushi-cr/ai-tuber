@@ -243,7 +243,7 @@ result = await agent.run("東京の明日の天気を教えて")
 | `BODY_URL` | (自動設定) | Body サービスの URL（RUN_MODE により決定） |
 | `WEATHER_MCP_URL` | `http://tools-weather:8001/sse` | MCP サーバーの URL |
 | `GOOGLE_API_KEY` | (必須) | Google Gemini API キー |
-| `MODEL_NAME` | `gemini-2.5-flash-lite` | 使用する Gemini モデル |
+| `MODEL_NAME` | `gemini-3.1-flash-lite` | 使用する Gemini モデル |
 | `ADK_TELEMETRY` | `false` | Google ADK テレメトリの有効化 |
 | `NEWS_DIR` | `/app/data/news` | ニュース原稿ディレクトリ |
 | `MAX_WAIT_CYCLES` | `30` | ニュース終了後の沈黙タイムアウト（秒） |

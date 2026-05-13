@@ -153,7 +153,7 @@ mind_config = loader.load_mind_config()
 
 # Agent に設定
 agent = Agent(
-    model=Gemini(model="gemini-2.5-flash-lite"),
+    model=Gemini(model="gemini-3.1-flash-lite"),
     instruction=system_instruction,
     tools=tools
 )

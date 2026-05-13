@@ -28,7 +28,7 @@ class Config:
     
     # AI設定
     google_api_key: str | None = None
-    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-3.1-flash-lite-preview"))
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-3.1-flash-lite"))
     adk_telemetry: bool = field(default_factory=lambda: os.getenv("ADK_TELEMETRY", "false").lower() == "true")
     
     # システム定数

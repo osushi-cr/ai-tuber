@@ -371,7 +371,7 @@ refactor: リファクタリング
 | `STREAMING_MODE` | `false` | YouTube 配信を有効化 |
 | `CHARACTER_NAME` | `ren` | 使用するキャラクター名 |
 | `NEWS_DIR` | `/app/data/news` | ニュース原稿ディレクトリ |
-| `MODEL_NAME` | `gemini-2.5-flash-lite` | Gemini モデル |
+| `MODEL_NAME` | `gemini-3.1-flash-lite` | Gemini モデル |
 | `ADK_TELEMETRY` | `false` | ADK テレメトリ |
 | `STORAGE_TYPE` | `filesystem` | ストレージ種別 (`filesystem` / `gcs`) |
 | `SECRET_PROVIDER_TYPE` | `env` | シークレット取得元 (`env` / `gcp`) |

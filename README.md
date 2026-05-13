@@ -211,7 +211,7 @@ data/mind/{character_name}/
 | `RUN_MODE` | `cli` | `cli` または `streamer` |
 | `BODY_URL` | (自動設定) | Body サービスの URL |
 | `WEATHER_MCP_URL` | `http://tools-weather:8001/sse` | 天気 MCP サーバーの URL |
-| `MODEL_NAME` | `gemini-2.5-flash-lite` | 使用モデル |
+| `MODEL_NAME` | `gemini-3.1-flash-lite` | 使用モデル |
 | `POLL_INTERVAL` | `1.0` | コメント取得の間隔（秒） |
 | `STREAM_TITLE` | - | 配信タイトル |
 | `STREAM_PRIVACY` | `private` | 配信公開設定 (`public`, `unlisted`, `private`) |

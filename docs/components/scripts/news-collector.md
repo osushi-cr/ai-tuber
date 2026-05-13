@@ -89,7 +89,7 @@ docker run --env-file .env news-collector
 | `GOOGLE_API_KEY` | ✅ | Gemini および Google Search API のキー |
 | `STORAGE_TYPE` | | `gcs` を指定すると GCS にアップロード。Cloud Run Job では必須。 |
 | `GCS_BUCKET_NAME` | | `STORAGE_TYPE=gcs` 時の保存先バケット名（Cloud Run では必須）。 |
-| `MODEL_NAME` | | Gemini モデル名（デフォルト: `gemini-2.5-flash-lite`） |
+| `MODEL_NAME` | | Gemini モデル名（デフォルト: `gemini-3.1-flash-lite`） |
 
 ---
 

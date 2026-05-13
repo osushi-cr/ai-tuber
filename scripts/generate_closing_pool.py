@@ -35,7 +35,7 @@ from body.streamer import voice_adapter_miotts  # noqa: E402
 CLOSINGS_DIR = _REPO_ROOT / "data/mind/kurara/closings"
 NUM_VARIATIONS = int(os.getenv("CLOSING_POOL_SIZE", "10"))
 MIOTTS_API_BASE = os.getenv("MIOTTS_API_BASE", "http://localhost:8001")
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite-preview")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 
 PROMPT = f"""あなたは「くらら」という妹キャラの AITuber です。 配信の締め (closing)
 のセリフを {NUM_VARIATIONS} 種類、 自然な日本語で生成してください。
