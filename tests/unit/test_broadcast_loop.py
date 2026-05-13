@@ -324,7 +324,10 @@ async def test_handle_news_reading():
         caption_summary="Content",
         wait_after=False,
     )
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once()
+    # handle_news が kurara_main に切替えること。最後 news (has_next=False) では
+    # _preload_first_qa_chitchat が QA 用 scene_switch を追加投入するため
+    # assert_called_once ではなく assert_any_call で本旨だけ確認する。
+    ctx.saint_graph.body.queue_scene_switch.assert_any_call("kurara_main")
     # scene strict と speak strict は別呼出（仕様変更で speak の retry を撤去）
     ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
         call(["scene-action"]),
@@ -1016,6 +1019,78 @@ async def test_preload_next_news_falls_back_to_qa_chitchat_on_last_news():
     assert ctx.preloaded_qa_action_ids == ["qa-speak"]
     # 通常の news prefetch 経路は呼ばれない
     ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+    # QA chitchat sentences の前に scene_switch + qa content image を投入している
+    ctx.saint_graph.body.queue_scene_switch.assert_any_call("kurara_main")
+    ctx.saint_graph.body.set_content_image.assert_any_call(image="qa")
+    # handle_qa 側で scene init を二重実行しないようマーク済
+    assert BroadcastPhase.QA in ctx.phase_scene_initialized
+
+
+@pytest.mark.asyncio
+async def test_preload_first_qa_chitchat_orders_scene_before_chitchat_enqueue():
+    """scene_switch / set_content_image は QA chitchat sentences より先に enqueue される。
+
+    body queue は順序保証のため、enqueue 順がそのまま再生順になる。
+    """
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    item1 = MagicMock(); item1.title = "T1"
+    news_service.items = [item1]
+    ctx = _make_ctx(news_service=news_service)
+    call_order: list[str] = []
+
+    async def record_scene(scene):
+        call_order.append(f"scene_switch:{scene}")
+        return {"action_id": "scene"}
+
+    async def record_image(**kwargs):
+        call_order.append(f"set_content_image:{kwargs}")
+
+    async def record_play(sentences, wait_after=True):
+        call_order.append(f"play_prepared_sentences:wait_after={wait_after}")
+        return ["qa-speak"]
+
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=record_scene)
+    ctx.saint_graph.body.set_content_image = AsyncMock(side_effect=record_image)
+    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
+        return_value=[("neutral", "振り返り")]
+    )
+    ctx.saint_graph.play_prepared_sentences = AsyncMock(side_effect=record_play)
+
+    await _preload_next_news(ctx)
+
+    assert call_order == [
+        "scene_switch:kurara_main",
+        "set_content_image:{'image': 'qa'}",
+        "play_prepared_sentences:wait_after=False",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preload_first_qa_chitchat_skips_scene_init_mark_on_scene_failure():
+    """scene_switch が失敗した場合は phase_scene_initialized に QA を add しない。
+
+    handle_qa 側で通常の scene init 経路を走らせるため。
+    """
+    news_service = MagicMock()
+    news_service.has_next.return_value = False
+    item1 = MagicMock(); item1.title = "T1"
+    news_service.items = [item1]
+    ctx = _make_ctx(news_service=news_service)
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(
+        side_effect=RuntimeError("OBS not connected")
+    )
+    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
+        return_value=[("neutral", "x")]
+    )
+    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["qa-speak"])
+
+    await _preload_next_news(ctx)
+
+    # chitchat 自体は enqueue される（fallback）
+    assert ctx.preloaded_qa_action_ids == ["qa-speak"]
+    # ただし scene_switch 失敗時は scene init マークしない
+    assert BroadcastPhase.QA not in ctx.phase_scene_initialized
 
 
 @pytest.mark.asyncio

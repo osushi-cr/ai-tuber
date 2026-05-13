@@ -187,13 +187,34 @@ async def _preload_first_qa_chitchat(ctx: BroadcastContext) -> None:
     """最後のニュース再生中に QA 初手 chitchat を裏で Gemini 取得→ enqueue する。
 
     最後の news 再生中は `_preload_next_news` の「次ニュース」対象が無いため、その
-    タイミングで代わりに QA 初手の振り返り chitchat を先行投入する。handle_qa 冒頭で
-    `ctx.preloaded_qa_action_ids` を検知して再生→クリア。news → QA 遷移の沈黙を縮める。
+    タイミングで代わりに QA 初手の振り返り chitchat を先行投入する。
+
+    body queue は順序保証で「現 news → 次 enqueue」を自動連結再生するため、QA
+    chitchat sentences だけ enqueue すると news scene/image のまま QA 音声が
+    流れてしまう。これを避けるため、QA chitchat の **前** に scene_switch ＋
+    qa content image を enqueue し、handle_qa 側の scene init をスキップさせる。
+
+    handle_qa 冒頭で `ctx.preloaded_qa_action_ids` を検知して再生完了待ち→クリア。
     """
     if ctx.preloaded_qa_action_ids is not None:
         return
     recent_titles = [item.title for item in ctx.news_service.items]
-    logger.info("Pre-queueing QA first chitchat during last news playback")
+    logger.info(
+        "Pre-queueing QA scene + first chitchat during last news playback"
+    )
+    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
+    scene_synced = True
+    try:
+        await ctx.saint_graph.body.queue_scene_switch(main_scene)
+    except Exception as e:
+        logger.warning(f"Pre-queue QA scene switch failed: {e}")
+        scene_synced = False
+    try:
+        await ctx.saint_graph.body.set_content_image(image="qa")
+    except Exception as e:
+        logger.warning(f"Pre-queue QA content image failed: {e}")
+        scene_synced = False
+
     try:
         sentences = await ctx.saint_graph.prepare_qa_chitchat_text(
             recent_titles=recent_titles
@@ -208,6 +229,9 @@ async def _preload_first_qa_chitchat(ctx: BroadcastContext) -> None:
             logger.warning("QA first chitchat pre-queue did not return action_ids")
             return
         ctx.preloaded_qa_action_ids = action_ids
+        if scene_synced:
+            # handle_qa 側で scene init を二重実行しないようマーク。
+            ctx.phase_scene_initialized.add(BroadcastPhase.QA)
     except Exception as e:
         logger.warning(f"Pre-queue QA first chitchat failed: {e}")
 
