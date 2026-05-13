@@ -51,7 +51,7 @@ logger = logging.getLogger("irodori_tts_server")
 HOST = os.getenv("IRODORI_HOST", "127.0.0.1")
 PORT = int(os.getenv("IRODORI_PORT", "8003"))
 
-CHECKPOINT_REPO = os.getenv("IRODORI_CHECKPOINT_REPO", "Aratako/Irodori-TTS-500M-v2")
+CHECKPOINT_REPO = os.getenv("IRODORI_CHECKPOINT_REPO", "Aratako/Irodori-TTS-500M-v3")
 CODEC_REPO = os.getenv("IRODORI_CODEC_REPO", "Aratako/Semantic-DACVAE-Japanese-32dim")
 REF_WAV = os.getenv(
     "IRODORI_REF_WAV",
@@ -112,7 +112,7 @@ def _prewarm(runtime: InferenceRuntime) -> None:
             ref_ensure_max=True,
             num_candidates=1,
             decode_mode="sequential",
-            seconds=8.0,
+            seconds=None,
             max_ref_seconds=30.0,
             num_steps=NUM_STEPS,
             t_schedule_mode=T_SCHEDULE_MODE,
@@ -156,12 +156,6 @@ class TTSResponse(BaseModel):
     sample_rate: int
 
 
-def _estimate_seconds(text: str) -> float:
-    """日本語 1 秒 ≒ 4.5 文字。マージン 1.0s は trim_tail で末尾を整えるための余白。上限 30s は訓練 latent steps 制約。"""
-    est = len(text) / 4.5 + 1.0
-    return max(4.0, min(30.0, est))
-
-
 def _wav_duration(path: str) -> float:
     with wave.open(path, "rb") as wav:
         return wav.getnframes() / float(wav.getframerate())
@@ -176,14 +170,13 @@ def healthz():
 async def synthesize(req: TTSRequest):
     if _runtime is None:
         raise HTTPException(status_code=503, detail="runtime not ready")
-    seconds = _estimate_seconds(req.text)
     # MPS は並列実行で Metal command buffer が衝突するため、ロック内で同期合成する。
     async with _synth_lock:
-        return await asyncio.to_thread(_synthesize_locked, req.text, seconds)
+        return await asyncio.to_thread(_synthesize_locked, req.text)
 
 
-def _synthesize_locked(text: str, seconds: float) -> TTSResponse:
-    logger.info("[synth] text_len=%d seconds=%.1f", len(text), seconds)
+def _synthesize_locked(text: str) -> TTSResponse:
+    logger.info("[synth] text_len=%d", len(text))
     assert _runtime is not None
     result = _runtime.synthesize(
         SamplingRequest(
@@ -196,7 +189,7 @@ def _synthesize_locked(text: str, seconds: float) -> TTSResponse:
             ref_ensure_max=True,
             num_candidates=1,
             decode_mode="sequential",
-            seconds=seconds,
+            seconds=None,
             max_ref_seconds=30.0,
             num_steps=NUM_STEPS,
             t_schedule_mode=T_SCHEDULE_MODE,
