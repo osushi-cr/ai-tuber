@@ -86,7 +86,6 @@ def _load_runtime() -> InferenceRuntime:
             codec_precision=PRECISION,
             codec_deterministic_encode=True,
             codec_deterministic_decode=True,
-            enable_watermark=False,
             compile_model=False,
             compile_dynamic=False,
         )
