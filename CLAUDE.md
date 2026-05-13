@@ -3,7 +3,7 @@
 ## タイトル・概要
 
 - **プロジェクト**: AITuber 配信システム（fork of Ren Studio）
-- **キャラクター**: くらら（妹キャラ・MioTTS-1.7B でローカル合成・LLM は Gemini 系）
+- **キャラクター**: くらら（妹キャラ・Irodori-TTS 500M v3 で Apple Silicon ローカル合成・LLM は Gemini 3.1 Flash Lite）
 - **目的**: 個人開発の AITuber が AI ニュース等を配信する。OBS + YouTube Live + ローカル TTS の三位一体構造（魂 Saint Graph / 肉体 Body / 精神 Mind）
 - **ペンネーム**: お寿司（@osushi_cr）
 - **branch 既定**: `feature/voice-adapter-miotts`（現主力）
@@ -47,8 +47,8 @@
 
 ▼ 中の人について
 ・お寿司（@osushi_cr）が個人開発で動かしてる AITuber
-・声は Irodori-TTS（500M、Apple Silicon ローカル合成）
-・LLM は Gemini 3.1 Flash Lite Preview
+・声は Irodori-TTS 500M v3（Apple Silicon ローカル合成）
+・LLM は Gemini 3.1 Flash Lite
 ・配信制御・ニュース選定はスクリプトで自動化
 
 ▼ ハッシュタグ
@@ -190,6 +190,62 @@ sed -i '' 's/^STREAMING_MODE=true/STREAMING_MODE=false/' ~/src/github.com/osushi
 - 二重実行で 1 配信 300 unit 余分に消費する事故が過去発生（2026-04-30）
 - 検証配信は `STREAM_PRIVACY=unlisted` で行い、本配信のみ `public`
 - `quotaExceeded` macOS 通知が出たら即座に saint_graph を kill して当日の配信を打ち切る
+
+---
+
+## 2026-05-13 切替の引き継ぎ（初回実走で確認）
+
+本日（2026-05-13）に Irodori-TTS と Gemini を両方 GA / stable 系に切り替えました。**次の本番配信が初回実走**になるため、以下を意識して観察してください。
+
+### 変更内容
+
+| 領域 | Before | After | commit |
+|---|---|---|---|
+| Irodori-TTS チェックポイント | `Aratako/Irodori-TTS-500M-v2` | **`Aratako/Irodori-TTS-500M-v3`** | `6f644df` |
+| Irodori-TTS `seconds` 指定 | `_estimate_seconds(text) = len/4.5 + 1.0` | **`seconds=None`**（Duration Predictor 自動推定） | `6f644df` |
+| Gemini モデル ID（saint_graph / closing） | `gemini-3.1-flash-lite-preview` | **`gemini-3.1-flash-lite`**（GA 版） | `d4fc4ad` |
+| docs/README 内表記 | `gemini-2.5-flash-lite` 残置（コードは既に 3.1） | **`gemini-3.1-flash-lite` に統一** | `d4fc4ad` |
+
+すべて `feature/voice-adapter-miotts` ブランチに push 済。
+
+### Irodori-TTS リポ側の要件
+
+ai-tuber の `scripts/start_irodori_server.sh` は `~/src/personal/Irodori-TTS` の `.venv` を使うため、**Irodori-TTS リポ側が v3 対応コードであること**が必要です。
+
+```bash
+cd ~/src/personal/Irodori-TTS
+git branch --show-current     # v3-bench / upstream/main いずれかであれば OK（v3 release コミット 6993be3 を含むこと）
+git log --oneline | grep "v3 release"
+```
+
+`pr-10-sway` ブランチに居ると v3 コードが入っていないので、`git switch v3-bench` か upstream/main 起点のブランチに切り替えてから配信を開始してください。
+
+### 配信中の観察ポイント
+
+1. **謎言語ハルシ**: v3 は `seconds=None` 必須。手動 seconds 指定が残っていると原稿読了後にハルシが入る挙動。ベンチでは出ていないはずですが、配信中に「読み終わったはずの文の後ろに意味不明な発話が混ざる」現象があれば旧経路復帰
+2. **キャラ声**: v3 は v2 に比べて声が若干高め。くらら声として OK 範囲（5/13 単体検証で確認済）だが、長時間配信で違和感が積み上がる可能性は残る
+3. **発話レイテンシ**: v3 + seconds=None は単体ベンチで v2 + seconds=8.0 比 wall-clock 21.6% 短縮（15 文 769 字で 58.61s → 45.94s）。`saint_graph` のニュース読み上げ間隔が体感で短くなっているはず
+4. **Gemini Flash Lite GA**: preview → stable で API 仕様自体は同一のはずですが、thinking mode・safety filter の挙動が変わっている可能性。応答内容に違和感があれば notes に記録
+
+### 即時ロールバック手順
+
+`.env` で環境変数を上書きすれば commit を戻さずに即座に旧構成へ戻せます。
+
+```bash
+# Irodori v2 に戻す
+echo "IRODORI_CHECKPOINT_REPO=Aratako/Irodori-TTS-500M-v2" >> .env
+
+# Gemini を preview に戻す
+echo "MODEL_NAME=gemini-3.1-flash-lite-preview" >> .env
+```
+
+ただし v2 戻しの場合は `seconds=None` のままだと v2 の挙動が安定しない可能性があるため、`scripts/irodori_tts_server.py` の `seconds=None` を `seconds=_estimate_seconds(text)` に戻すコード変更も必要（→ commit `6f644df` を `git revert` するのが確実）。
+
+### 配信前チェック追加 1 行
+
+「配信前チェックリスト」の最後に以下を追加で意識:
+
+| 9 | Irodori-TTS リポが v3 対応ブランチか確認 | `cd ~/src/personal/Irodori-TTS && git log --oneline -3` で v3 release コミットを含むこと |
 
 ---
 
