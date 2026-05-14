@@ -181,6 +181,7 @@ sed -i '' 's/^STREAMING_MODE=true/STREAMING_MODE=false/' ~/src/github.com/osushi
 | 6 | サムネ画像が最新（特集回は差し替え） | `data/mind/kurara/assets/contents/thumbnail.png` |
 | 7 | OBS の current scene を `waiting` にしておく（保険）| OBS 手動操作 |
 | 8 | `.env` の `STREAMING_MODE=true` 切替済 | `grep STREAMING_MODE .env` |
+| 9 | **YouTube OAuth token を事前 refresh 済** | `./.venv/bin/python scripts/refresh_youtube_token.py` — `OK: token ...` で成功。NG なら interactive flow に飛ぶので saint_graph 起動前に必ず通す |
 
 ---
 
@@ -245,7 +246,7 @@ echo "MODEL_NAME=gemini-3.1-flash-lite-preview" >> .env
 
 「配信前チェックリスト」の最後に以下を追加で意識:
 
-| 9 | Irodori-TTS リポが v3 対応ブランチか確認 | `cd ~/src/personal/Irodori-TTS && git log --oneline -3` で v3 release コミットを含むこと |
+| 10 | Irodori-TTS リポが v3 対応ブランチか確認 | `cd ~/src/personal/Irodori-TTS && git log --oneline -3` で v3 release コミットを含むこと |
 
 ---
 

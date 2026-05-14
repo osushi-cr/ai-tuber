@@ -126,14 +126,16 @@ class BodyClient:
     
     async def start_broadcast(self, config: Optional[Dict[str, Any]] = None) -> str:
         """配信または録画を開始します。"""
-        data = await self._request("POST", "/api/broadcast/start", config or {})
+        # OAuth interactive flow / YouTube API 遅延で 30s 超になり得るため timeout を延ばす
+        data = await self._request("POST", "/api/broadcast/start", config or {}, timeout=120.0)
         if data:
             return data.get("result", "Broadcast started")
         return "Error: Failed to start broadcast"
-    
+
     async def stop_broadcast(self) -> str:
         """配信または録画を停止します。"""
-        data = await self._request("POST", "/api/broadcast/stop")
+        # broadcast complete transition で YouTube API 応答待ちが発生するため timeout を延ばす
+        data = await self._request("POST", "/api/broadcast/stop", timeout=120.0)
         if data:
             return data.get("result", "Broadcast stopped")
         return "Error: Failed to stop broadcast"
