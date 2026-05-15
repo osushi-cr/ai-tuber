@@ -21,10 +21,15 @@ from .body_client import BodyClient
 
 class BroadcastPhase(Enum):
     """配信のフェーズを表す列挙型。"""
+    WAITING = "waiting"   # 視聴者集合タイム（60秒）。 裏で intro / news1 を事前合成
     INTRO   = "intro"     # 開始挨拶
     NEWS    = "news"      # ニュース読み上げ中
     QA      = "qa"        # ニュース終了 → コメント拾いコーナー（促進セリフ＋コメント反応）
     CLOSING = "closing"   # 締めの挨拶 → 配信停止
+
+
+# WAITING フェーズの滞在時間（秒）。 視聴者集合タイムとして OBS は waiting シーンを表示。
+WAITING_DURATION = float(os.getenv("BROADCAST_WAITING_DURATION", "60.0"))
 
 
 @dataclass
@@ -35,6 +40,10 @@ class BroadcastContext:
     idle_counter: int = 0
     # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
     next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
+    # WAITING フェーズで事前合成した intro / news1 の prepared sentences。
+    # 各要素は {"file_path", "duration", "style", "text"} の dict。
+    prepared_intro: Optional[List[Dict[str, Any]]] = None
+    prepared_news1: Optional[List[Dict[str, Any]]] = None
     # handle_intro で news1 を speak まで先回り投入したときの action_ids と原ニュース。
     # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
     preloaded_news_action_ids: Optional[List[str]] = None
@@ -47,6 +56,46 @@ class BroadcastContext:
     qa_speak_counter: int = 0
     closing_reason: Optional[str] = None
     phase_scene_initialized: set[BroadcastPhase] = field(default_factory=set)
+
+
+async def handle_waiting(ctx: BroadcastContext) -> BroadcastPhase:
+    """WAITING: 視聴者集合タイム（既定 60秒）。
+
+    OBS は body の start_broadcast で waiting シーンに切替済。 視聴者がまだ集まる
+    フェーズなので音声は流さず、 60秒待つ間に裏で intro / news1 の Gemini 生成 +
+    TTS 合成（wav 化）まで完了させる。 経過の瞬間に音声を再生できる状態を作る。
+    """
+    intro_task = asyncio.create_task(_prepare_intro_speech(ctx))
+    news1_task = asyncio.create_task(_prepare_news1_speech(ctx))
+    wait_task = asyncio.create_task(asyncio.sleep(WAITING_DURATION))
+
+    await asyncio.gather(intro_task, news1_task, wait_task)
+    return BroadcastPhase.INTRO
+
+
+async def _prepare_intro_speech(ctx: BroadcastContext) -> None:
+    """intro セリフを Gemini 生成 → TTS 合成して ctx.prepared_intro に格納。"""
+    try:
+        sentences = await ctx.saint_graph.prepare_intro_text()
+        if sentences:
+            ctx.prepared_intro = await ctx.saint_graph.prepare_sentences_synth(sentences)
+    except Exception as e:
+        logger.warning(f"_prepare_intro_speech failed: {e}")
+
+
+async def _prepare_news1_speech(ctx: BroadcastContext) -> None:
+    """news1 セリフを Gemini 生成 → TTS 合成して ctx.prepared_news1 に格納。"""
+    item = ctx.news_service.peek_current_item()
+    if item is None:
+        return
+    try:
+        sentences = await ctx.saint_graph.prepare_news_reading_text(
+            title=item.title, content=item.content
+        )
+        if sentences:
+            ctx.prepared_news1 = await ctx.saint_graph.prepare_sentences_synth(sentences)
+    except Exception as e:
+        logger.warning(f"_prepare_news1_speech failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +271,12 @@ async def _preload_first_qa_chitchat(ctx: BroadcastContext) -> None:
         if not sentences:
             logger.warning("QA first chitchat prefetch returned empty sentences")
             return
+        # last news の caption が QA chitchat 再生中に残らないよう、speak enqueue 前にクリア。
+        # body キューは順次処理なので、chitchat 音声が始まる時点で caption は消えている。
+        try:
+            await ctx.saint_graph.body.clear_news_caption()
+        except Exception as e:
+            logger.warning(f"Pre-queue QA caption clear failed: {e}")
         action_ids = await ctx.saint_graph.play_prepared_sentences(
             sentences, wait_after=False
         )
@@ -348,147 +403,65 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
 # ---------------------------------------------------------------------------
 
 async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
-    """INTRO: 配信開始の挨拶を行い、NEWS フェーズへ遷移する。
+    """INTRO: WAITING で事前合成済みの intro / news1 を再生し、NEWS フェーズへ遷移する。
 
-    演出順序:
-        1. waiting シーン切替 (best-effort) ＋ chitchat BGM
-        2. news1 prefetch をバックグラウンドで開始
-        3. waiting 中に prepare_intro_text() で Gemini からテキストだけ取得
-           （TTS / 発話キュー投入はまだしない）
-        4. kurara_main シーン strict 切替
-        5. op (intro) BGM へ切替
-        6. play_prepared_sentences() で TTS + 再生を speak queue へ投入し、
-           completed まで strict 待ち
-        7. auto_filler 起動（NEWS 以降の沈黙埋め用）
-        8. NEWS フェーズへ
+    順序保証のため scene / bgm / content / speak をすべて worker queue に積む。
+    視聴者目線:
+      1. kurara_main 切替（waiting → kurara）
+      2. BGM op（intro 用）
+      3. content_image(intro) 表示（kurara の右に intro overlay）
+      4. intro speak 再生（事前合成 wav）
+      5. content_image を畳む（news1 開始前）
+      6. BGM news へ切替
+      7. news1 speak 再生（事前合成 wav, caption 同期: タイトル + 要約）
+      8. auto_filler 起動（NEWS 以降の沈黙埋め用）
 
-    Gemini 応答取得（重い）は waiting 中に済ませ、 TTS + 再生は kurara_main 切替後の
-    キューに乗せる。 worker キューは順次処理なので「scene 切替 → 挨拶 TTS → 再生」
-    の順序が確実に保たれ、 視聴者には kurara_main で挨拶が始まるように見える。
-
-    auto_filler は INTRO 完了後に起動するため、 INTRO 中に chitchat が割り込まない。
+    すべて queue に積むため、 saint_graph 側で wait はしない（順序は body queue が保証）。
     """
-    # waiting scene は配信開始前演出のための補助 scene で、 失敗しても fatal ではない。
-    waiting_scene = os.getenv("BROADCAST_WAITING_SCENE", "waiting")
-    await _queue_and_wait_strict_once(
-        ctx,
-        lambda: ctx.saint_graph.body.queue_scene_switch(waiting_scene),
-        "INTRO start waiting_scene",
-    )
-
-    # waiting 中の BGM。 失敗しても致命ではない。
-    try:
-        await ctx.saint_graph.body.switch_bgm("chitchat")
-    except Exception as e:
-        logger.warning(f"Failed to switch waiting BGM (chitchat): {e}")
-
-    # news1 prefetch をバックグラウンドで仕込む（INTRO テキスト取得と並行）
-    if ctx.news_service.has_next():
-        first_item = ctx.news_service.peek_current_item()
-        if first_item:
-            logger.info(f"Prefetching news1: {first_item.title}")
-            ctx.next_news_task = asyncio.create_task(
-                ctx.saint_graph.prepare_news_reading_text(
-                    title=first_item.title, content=first_item.content
-                )
-            )
-
-    # waiting 中に Gemini で挨拶テキストを取得（TTS と発話キュー投入はしない）。
-    # ここが重い処理（Gemini API + retry）なので chitchat BGM で見せる。
-    intro_sentences = await ctx.saint_graph.prepare_intro_text()
-
-    # news1 prefetch も完了するまで waiting で待つ（演出時間の確保）。
-    # gemini-3.1-flash-lite は intro/news が両方とも数秒で返るため、待たないと waiting
-    # シーンの chitchat BGM が一瞬で終わってしまう。最大 15s で打ち切り、間に合わなければ
-    # NEWS フェーズで通常の prefetch 待ちに任せる。
-    if ctx.next_news_task is not None and not ctx.next_news_task.done():
-        try:
-            await asyncio.wait_for(asyncio.shield(ctx.next_news_task), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.info("news1 prefetch did not finish within waiting window (15s); proceeding")
-        except Exception as e:
-            logger.warning(f"news1 prefetch errored during waiting wait: {e}")
-
-    # kurara_main へ strict 切替（挨拶はキャラ画面で流す）
     main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-    ok = await _queue_scene_switch_strict(
-        ctx,
-        main_scene,
-        "INTRO end scene_switch",
-    )
-    if not ok:
-        ctx.closing_reason = "technical_failure"
-        return BroadcastPhase.CLOSING
 
-    # kurara_main に切替えてから op BGM
-    try:
-        await ctx.saint_graph.body.switch_bgm("op")
-    except Exception as e:
-        logger.warning(f"Failed to switch INTRO BGM (op): {e}")
+    # 1. kurara_main 切替
+    await ctx.saint_graph.body.queue_scene_switch(main_scene)
+    # 2. BGM op（intro 用）
+    await ctx.saint_graph.body.queue_bgm_switch("op")
+    # 3. content_image(intro) 表示
+    await ctx.saint_graph.body.queue_content_set(image="intro", visible=True)
 
-    # intro 画像 overlay をくららの右に表示（挨拶中ずっと出す）
-    try:
-        await ctx.saint_graph.body.set_content_image(image="intro")
-    except Exception as e:
-        logger.warning(f"Failed to set intro content image: {e}")
-
-    # 取得済セリフを TTS + 再生 queue に投入。 worker は kurara_main 切替後に
-    # この speak action を処理するため、 kurara_main 画面で挨拶が始まる。
-    if intro_sentences:
-        intro_action_ids = await ctx.saint_graph.play_prepared_sentences(
-            intro_sentences, wait_after=False
+    # 4. intro speak（prepared wav, caption なし）
+    for sentence in ctx.prepared_intro or []:
+        await ctx.saint_graph.body.queue_speak(
+            text=sentence.get("text", ""),
+            style=sentence.get("style"),
+            prepared_wav_path=sentence.get("file_path"),
+            prepared_duration=sentence.get("duration"),
         )
 
-        # news1 voice 先回り投入: intro 再生中に news1 の合成を裏で進める。
-        # body の改修🅐 で speak は enqueue 時点で合成 task が背景開始するため、
-        # intro 再生終了時には news1 合成が完了済 → ギャップなしで news1 が始まる。
-        news1_item = ctx.news_service.peek_current_item()
-        if news1_item is not None and ctx.next_news_task is not None:
-            try:
-                news1_sentences = await ctx.next_news_task
-            except Exception as e:
-                logger.warning(f"news1 prefetch failed during intro queueing: {e}")
-                news1_sentences = None
-            ctx.next_news_task = None
+    # 5. content_image を畳む（news1 開始前に intro overlay を消す）
+    await ctx.saint_graph.body.queue_content_set(image="", visible=False)
+    # 6. BGM news へ切替
+    await ctx.saint_graph.body.queue_bgm_switch("news")
 
-            if news1_sentences:
-                logger.info(f"Pre-queueing news1 speak during intro: {news1_item.title}")
-                news1_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
-                    news1_sentences,
-                    caption_title=news1_item.title,
-                    caption_summary=news1_item.content,
-                    wait_after=False,
-                )
-                ctx.preloaded_news_action_ids = news1_action_ids
-                ctx.preloaded_news_item = news1_item
-
-        if intro_action_ids:
-            await ctx.saint_graph.body.wait_for_queue_strict(
-                action_ids=intro_action_ids
+    # 7. news1 speak（prepared wav, 最初の sentence に caption 同期）
+    news1_item = ctx.news_service.peek_current_item()
+    if ctx.prepared_news1 and news1_item is not None:
+        for i, sentence in enumerate(ctx.prepared_news1):
+            await ctx.saint_graph.body.queue_speak(
+                text=sentence.get("text", ""),
+                style=sentence.get("style"),
+                prepared_wav_path=sentence.get("file_path"),
+                prepared_duration=sentence.get("duration"),
+                caption_title=news1_item.title if i == 0 else None,
+                caption_summary=news1_item.content if i == 0 else None,
             )
+        # news1 を消化済とみなしてカーソル前進（handle_news は news2 から扱う）
+        ctx.news_service.get_next_item()
 
-    # intro speak 完了後、news1 (preloaded) 再生が始まる直前に BGM を news に切替える。
-    # run_broadcast_loop の自動切替（next_phase 検知時）だと news1 再生開始後になり、
-    # 視聴者は news1 を op BGM のまま聞いてしまう。INTRO で waiting=chitchat→kurara_main=op を
-    # 動的切替してるのと同じ理屈で、INTRO の責務として news 突入直前に BGM を移行させる。
+    # 8. auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込みを避ける）。
+    #    NEWS / QA フェーズの沈黙埋めはここから先で動く。
     try:
-        await ctx.saint_graph.body.switch_bgm("news")
+        await ctx.saint_graph.body.queue_auto_filler_start()
     except Exception as e:
-        logger.warning(f"Failed to switch INTRO->NEWS BGM (news): {e}")
-
-    # 挨拶完了。 NEWS フェーズに渡す前に intro 画像を畳む。
-    try:
-        await ctx.saint_graph.body.set_content_image(visible=False)
-    except Exception as e:
-        logger.warning(f"Failed to clear intro content image: {e}")
-
-    # auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込みを避ける）。
-    # NEWS / QA フェーズの沈黙埋めはここから先で動く。
-    await _queue_and_wait_strict_once(
-        ctx,
-        ctx.saint_graph.body.queue_auto_filler_start,
-        "INTRO end auto_filler_start",
-    )
+        logger.warning(f"Failed to queue auto_filler_start: {e}")
 
     return BroadcastPhase.NEWS
 
@@ -803,6 +776,7 @@ async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
 # ---------------------------------------------------------------------------
 
 _HANDLERS = {
+    BroadcastPhase.WAITING: handle_waiting,
     BroadcastPhase.INTRO:   handle_intro,
     BroadcastPhase.NEWS:    handle_news,
     BroadcastPhase.QA:      handle_qa,
@@ -811,9 +785,10 @@ _HANDLERS = {
 
 # フェーズと BGM の対応。 obs_adapter.BGM_SOURCES の bgm_id と一致させる。
 _PHASE_BGM = {
-    # INTRO は handle_intro 内で waiting=chitchat → kurara_main=op を動的切替するため None。
-    # NEWS は handle_intro 末尾で news1 再生開始直前に動的切替するため None（自動切替を待つと
-    # news1 が op BGM のまま再生される事故になる）。
+    # WAITING / INTRO / NEWS の BGM は各ハンドラ内で queue 経由で切替するため None。
+    # WAITING は OBS の waiting シーン側で chitchat BGM を流す前提（body は触らない）。
+    # INTRO は handle_intro 冒頭で op → 終盤で news を queue に積む。
+    BroadcastPhase.WAITING: None,
     BroadcastPhase.INTRO:   None,
     BroadcastPhase.NEWS:    None,
     BroadcastPhase.QA:      "chitchat",
@@ -853,11 +828,11 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
     """
     ステートマシンのメインループ。
 
-    INTRO から始まり、各ハンドラが返す次フェーズに従って遷移します。
+    WAITING から始まり、各ハンドラが返す次フェーズに従って遷移します。
     フェーズ遷移時に対応 BGM へ切り替えます。
     ハンドラが None を返すとループを終了します。
     """
-    phase = BroadcastPhase.INTRO
+    phase = BroadcastPhase.WAITING
     logger.info("Entering Broadcast Loop (state machine)...")
 
     try:
@@ -870,10 +845,8 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
             # INTRO 挨拶への chitchat 割り込みを防ぐ。
             await ctx.saint_graph.register_chitchat()
 
-            # 配信開始時の最初のフェーズ（INTRO）BGM は handle_intro 内で
-            # waiting=chitchat → kurara_main=op の順に動的切替する。 ここでは
-            # _switch_bgm_for_phase を呼ばない（_PHASE_BGM[INTRO] が None のため
-            # no-op だが、 意図を明確にする）。
+            # WAITING フェーズの BGM は OBS の waiting シーンに紐付いた音源を流す
+            # 設計（body 側からは触らない）。 _switch_bgm_for_phase は no-op。
 
         while phase is not None:
             try:

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, AsyncMock, patch, call
 from saint_graph.broadcast_loop import (
     BroadcastPhase,
     BroadcastContext,
+    handle_waiting,
     handle_intro,
     handle_news,
     handle_qa,
@@ -29,6 +30,14 @@ def _make_ctx(news_service=None, comments=None):
     mock_saint.prepare_news_reading_text = AsyncMock(return_value=[("neutral", "本文")])
     mock_saint.play_prepared_sentences = AsyncMock(return_value=["intro-speak"])
     mock_saint.play_prepared_sentences_with_caption = AsyncMock(return_value=["speak-action"])
+    # WAITING フェーズで使う先行合成メソッド。 sentences のリストを受け取り、 各 sentence の
+    # TTS 合成結果 (file_path / duration / style / text) を辞書で返す。
+    mock_saint.prepare_sentences_synth = AsyncMock(
+        side_effect=lambda sentences: [
+            {"file_path": f"/tmp/{i}.wav", "duration": 1.0, "style": s[0], "text": s[1]}
+            for i, s in enumerate(sentences)
+        ]
+    )
     mock_saint.process_news_finished = AsyncMock()
     mock_saint.process_closing = AsyncMock()
     
@@ -48,6 +57,9 @@ def _make_ctx(news_service=None, comments=None):
     mock_saint.body.queue_caption_clear = AsyncMock(return_value={"action_id": "caption-clear"})
     mock_saint.body.queue_auto_filler_start = AsyncMock(return_value={"action_id": "auto-start"})
     mock_saint.body.queue_auto_filler_stop = AsyncMock(return_value={"action_id": "auto-stop"})
+    mock_saint.body.queue_bgm_switch = AsyncMock(return_value={"action_id": "bgm-action"})
+    mock_saint.body.queue_content_set = AsyncMock(return_value={"action_id": "content-action"})
+    mock_saint.body.queue_speak = AsyncMock(return_value={"action_id": "speak-action"})
     mock_saint.body.wait_for_queue_strict = AsyncMock(return_value=True)
     mock_saint.register_chitchat = AsyncMock()
 
@@ -57,134 +69,6 @@ def _make_ctx(news_service=None, comments=None):
         saint_graph=mock_saint,
         news_service=mock_news,
     )
-
-
-@pytest.mark.asyncio
-async def test_handle_intro():
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.prepare_intro_text.assert_called_once()
-    ctx.saint_graph.play_prepared_sentences.assert_called_once()
-    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
-    ctx.saint_graph.body.queue_scene_switch.assert_has_calls([
-        call("waiting"),
-        call("kurara_main"),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_switches_bgm_chitchat_then_op():
-    """waiting で chitchat BGM、 kurara_main 切替後に op BGM を流す。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-
-    await handle_intro(ctx)
-
-    ctx.saint_graph.body.switch_bgm.assert_has_calls([
-        call("chitchat"),
-        call("op"),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_orders_text_generation_before_scene_switch_and_speech():
-    """waiting 中に prepare_intro_text → kurara_main 切替 → play_prepared_sentences の順。
-    Gemini テキスト取得は waiting シーン中、 TTS+再生は kurara_main 切替後。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    call_order: list[str] = []
-
-    ctx = _make_ctx(news_service=news_service)
-
-    async def record_scene(scene):
-        call_order.append(f"scene:{scene}")
-        return {"action_id": "scene-action"}
-
-    async def record_prepare():
-        call_order.append("prepare_intro_text")
-        return [("joyful", "やっほ〜")]
-
-    async def record_play(sentences, wait_after=True):
-        call_order.append(f"play_prepared_sentences:wait_after={wait_after}")
-        return ["intro-speak"]
-
-    async def record_strict(action_ids=None, **kwargs):
-        if action_ids == ["intro-speak"]:
-            call_order.append("wait_intro_speech")
-        return True
-
-    async def record_filler_start():
-        call_order.append("auto_filler_start")
-        return {"action_id": "auto-start"}
-
-    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=record_scene)
-    ctx.saint_graph.prepare_intro_text = AsyncMock(side_effect=record_prepare)
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(side_effect=record_play)
-    ctx.saint_graph.body.wait_for_queue_strict = AsyncMock(side_effect=record_strict)
-    ctx.saint_graph.body.queue_auto_filler_start = AsyncMock(side_effect=record_filler_start)
-
-    await handle_intro(ctx)
-
-    # waiting → prepare_intro_text (Gemini) → kurara_main 切替 → TTS+再生投入
-    # → INTRO 再生完了待ち → auto_filler 起動
-    assert call_order == [
-        "scene:waiting",
-        "prepare_intro_text",
-        "scene:kurara_main",
-        "play_prepared_sentences:wait_after=False",
-        "wait_intro_speech",
-        "auto_filler_start",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_starts_auto_filler_after_intro_speech():
-    """auto_filler は INTRO 完了後に起動する（INTRO 中の chitchat 割り込み防止）。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["intro-action"])
-
-    await handle_intro(ctx)
-
-    ctx.saint_graph.prepare_intro_text.assert_called_once()
-    ctx.saint_graph.play_prepared_sentences.assert_called_once()
-    assert ctx.saint_graph.play_prepared_sentences.call_args.kwargs["wait_after"] is False
-    ctx.saint_graph.body.queue_auto_filler_start.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(
-        action_ids=["intro-action"]
-    )
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_prefetches_first_news_text_only():
-    news_service = MagicMock()
-    news_service.has_next.return_value = True
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service)
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    assert ctx.next_news_task is not None
-    await ctx.next_news_task
-    ctx.saint_graph.prepare_intro_text.assert_called_once()
-    ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
-        title="Title", content="Content"
-    )
-    ctx.saint_graph.process_news_reading.assert_not_called()
-    ctx.saint_graph.body.queue_scene_switch.assert_has_calls([
-        call("waiting"),
-        call("kurara_main"),
-    ])
 
 
 @pytest.mark.asyncio
@@ -428,87 +312,6 @@ async def test_handle_news_scene_strict_retries_then_closes_on_double_failure():
     )
     # scene 確定前に CLOSING へフォールバックするため speak は投入されない
     ctx.saint_graph.play_prepared_sentences_with_caption.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_closes_when_main_scene_strict_fails():
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"action_id": "waiting"},
-        {"action_id": "main-1"},
-        {"action_id": "main-2"},
-    ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [True, False, False]
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.CLOSING
-    assert ctx.closing_reason == "technical_failure"
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["waiting"]),
-        call(["main-1"]),
-        call(["main-2"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_continues_when_waiting_scene_fails_once(caplog):
-    """waiting scene は best-effort（once helper）のため、 失敗しても retry せず loop は継続する。"""
-    caplog.set_level("WARNING", logger="saint-graph")
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"action_id": "waiting-1"},
-        {"action_id": "main"},
-    ]
-    # waiting strict 失敗、 main strict、 INTRO speech strict、 auto_filler_start strict
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, True, True, True]
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    assert ctx.closing_reason is None
-    assert "INTRO start waiting_scene failed" in caplog.text
-    # waiting は 1 回投入のみ（retry なし）、 続いて main 切替
-    ctx.saint_graph.body.queue_scene_switch.assert_has_calls([
-        call("waiting"),
-        call("kurara_main"),
-    ])
-    # waiting strict, main strict, INTRO speech action 待ち, auto_filler_start strict
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["waiting-1"]),
-        call(["main"]),
-        call(action_ids=["intro-speak"]),
-        call(["auto-start"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_continues_when_waiting_scene_has_no_action_id():
-    """waiting の queue 投入で action_id が返らなくても、 loop は止めず main 切替へ進む。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"status": "error"},
-        {"action_id": "main"},
-    ]
-    ctx.saint_graph.body.wait_for_queue_strict.return_value = True
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    # action_id 欠落時のフォールバックとして wait_for_queue が呼ばれる
-    ctx.saint_graph.body.wait_for_queue.assert_called_once()
-    # main strict, INTRO speech strict, auto_filler_start strict が実行される
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["main"]),
-        call(action_ids=["intro-speak"]),
-        call(["auto-start"]),
-    ])
 
 
 @pytest.mark.asyncio
@@ -831,7 +634,7 @@ async def test_run_broadcast_loop_moves_startup_presentation_to_loop():
     async def finish_immediately(_ctx):
         return None
 
-    with patch("saint_graph.broadcast_loop._HANDLERS", {BroadcastPhase.INTRO: finish_immediately}):
+    with patch("saint_graph.broadcast_loop._HANDLERS", {BroadcastPhase.WAITING: finish_immediately}):
         await run_broadcast_loop(ctx)
 
     ctx.saint_graph.body.queue_caption_clear.assert_called_once()
@@ -843,38 +646,6 @@ async def test_run_broadcast_loop_moves_startup_presentation_to_loop():
     # 終了時の auto_filler_stop は引き続き finally で呼ばれる
     ctx.saint_graph.body.queue_auto_filler_stop.assert_called_once()
     ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(["auto-stop"])
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_warns_and_continues_when_auto_filler_start_fails(caplog):
-    """auto_filler_start が strict 失敗しても handle_intro は NEWS フェーズへ進む。"""
-    caplog.set_level("WARNING", logger="saint-graph")
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    # waiting strict, main strict, INTRO speech strict, auto_filler_start strict
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [True, True, True, False]
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.body.queue_auto_filler_start.assert_called_once()
-    assert "INTRO end auto_filler_start failed" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_continues_when_auto_filler_start_has_no_action_id(caplog):
-    """auto_filler_start の queue 投入で action_id が返らなくても handle_intro は継続。"""
-    caplog.set_level("WARNING", logger="saint-graph")
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_auto_filler_start.return_value = {"status": "error"}
-
-    phase = await handle_intro(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    assert "INTRO end auto_filler_start did not return action_id" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -901,30 +672,6 @@ async def test_run_broadcast_loop_detects_startup_caption_clear_failure():
 # ---------------------------------------------------------------------------
 # content 画像 overlay（くららの右に intro / qa / end 画像を出す）
 # ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_intro_sets_intro_content_image_during_speech():
-    """kurara_main 切替後、 挨拶 speak 投入前に intro 画像を表示する。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-
-    await handle_intro(ctx)
-
-    ctx.saint_graph.body.set_content_image.assert_any_call(image="intro")
-
-
-@pytest.mark.asyncio
-async def test_handle_intro_clears_content_image_before_news_phase():
-    """挨拶完了後、 NEWS フェーズに渡す前に intro 画像を畳む。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    ctx = _make_ctx(news_service=news_service)
-
-    await handle_intro(ctx)
-
-    ctx.saint_graph.body.set_content_image.assert_any_call(visible=False)
-
 
 @pytest.mark.asyncio
 async def test_handle_intro_does_not_set_caption_for_intro_text():
@@ -1108,6 +855,209 @@ async def test_preload_next_news_skips_qa_chitchat_when_already_preloaded():
 
     ctx.saint_graph.prepare_qa_chitchat_text.assert_not_called()
     assert ctx.preloaded_qa_action_ids == ["existing"]
+
+
+def _ctx_with_prepared(news_service=None, prepared_intro=None, prepared_news1=None):
+    """handle_intro テスト用に prepared_intro / prepared_news1 を事前にセットした ctx。"""
+    ctx = _make_ctx(news_service=news_service)
+    ctx.prepared_intro = prepared_intro or [
+        {"file_path": "/tmp/intro_0.wav", "duration": 3.0, "style": "joyful", "text": "やっほ〜"}
+    ]
+    ctx.prepared_news1 = prepared_news1 or [
+        {"file_path": "/tmp/news1_0.wav", "duration": 5.0, "style": "neutral", "text": "本文"}
+    ]
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_uses_prepared_speeches_without_resynthesis():
+    """handle_intro は ctx.prepared_intro / prepared_news1 を使い、 再合成 (prepare_intro_text /
+    prepare_news_reading_text / prepare_sentences_synth) は呼ばない。
+    """
+    news_service = MagicMock()
+    item = MagicMock()
+    item.title = "Title"
+    item.content = "Content"
+    news_service.peek_current_item.return_value = item
+    news_service.has_next.return_value = True
+
+    ctx = _ctx_with_prepared(news_service=news_service)
+
+    phase = await handle_intro(ctx)
+
+    assert phase == BroadcastPhase.NEWS
+    ctx.saint_graph.prepare_intro_text.assert_not_called()
+    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_queue_order():
+    """handle_intro の enqueue 順序:
+    scene_switch(kurara_main) → bgm(op) → content_set(intro) → intro speak (prepared) →
+    content_set("") → bgm(news) → news1 speak (prepared)。
+
+    speak / scene / bgm / content が全部 worker queue を通るので、 視聴者目線では
+    順序通りに切り替わる。
+    """
+    news_service = MagicMock()
+    item = MagicMock()
+    item.title = "Title"
+    item.content = "Summary"
+    news_service.peek_current_item.return_value = item
+    news_service.has_next.return_value = True
+
+    ctx = _ctx_with_prepared(news_service=news_service)
+
+    # speak は body.queue_speak で投入、 content は body.queue_content_set。
+    # 順序を見るため、 単一の events list に時系列で記録する。
+    events = []
+
+    async def queue_scene_switch(scene):
+        events.append(("scene_switch", scene))
+        return {"action_id": f"scene-{scene}"}
+
+    async def queue_bgm_switch(bgm_id):
+        events.append(("bgm_switch", bgm_id))
+        return {"action_id": f"bgm-{bgm_id}"}
+
+    async def queue_content_set(image, visible):
+        events.append(("content_set", image, visible))
+        return {"action_id": f"content-{image}-{visible}"}
+
+    async def queue_speak(text=None, style=None, speaker_id=None,
+                         caption_title=None, caption_summary=None,
+                         prepared_wav_path=None, prepared_duration=None):
+        events.append(("speak", prepared_wav_path, caption_title))
+        return {"action_id": f"speak-{prepared_wav_path}"}
+
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=queue_scene_switch)
+    ctx.saint_graph.body.queue_bgm_switch = AsyncMock(side_effect=queue_bgm_switch)
+    ctx.saint_graph.body.queue_content_set = AsyncMock(side_effect=queue_content_set)
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+
+    await handle_intro(ctx)
+
+    # 期待順序: scene → bgm(op) → content(intro) → speak(intro) → content("") → bgm(news) → speak(news1)
+    assert events == [
+        ("scene_switch", "kurara_main"),
+        ("bgm_switch", "op"),
+        ("content_set", "intro", True),
+        ("speak", "/tmp/intro_0.wav", None),
+        ("content_set", "", False),
+        ("bgm_switch", "news"),
+        ("speak", "/tmp/news1_0.wav", "Title"),  # news1 は caption 同期
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_intro_news1_speak_has_caption_synced():
+    """handle_intro 内で news1 の speak action は caption_title / caption_summary が
+    渡されている（speak worker 内で再生開始時に caption が表示される設計）。
+    """
+    news_service = MagicMock()
+    item = MagicMock()
+    item.title = "ニュースタイトル"
+    item.content = "ニュース要約本文"
+    news_service.peek_current_item.return_value = item
+    news_service.has_next.return_value = True
+
+    captured = []
+
+    async def queue_speak(text=None, style=None, speaker_id=None,
+                         caption_title=None, caption_summary=None,
+                         prepared_wav_path=None, prepared_duration=None):
+        captured.append({
+            "prepared_wav_path": prepared_wav_path,
+            "caption_title": caption_title,
+            "caption_summary": caption_summary,
+        })
+        return {"action_id": "speak-action"}
+
+    ctx = _ctx_with_prepared(news_service=news_service)
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+    ctx.saint_graph.body.queue_content_set = AsyncMock(return_value={"action_id": "c"})
+    ctx.saint_graph.body.queue_bgm_switch = AsyncMock(return_value={"action_id": "b"})
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(return_value={"action_id": "s"})
+
+    await handle_intro(ctx)
+
+    # intro speak: caption なし
+    assert captured[0]["caption_title"] is None
+    # news1 speak: caption あり
+    assert captured[1]["caption_title"] == "ニュースタイトル"
+    assert captured[1]["caption_summary"] == "ニュース要約本文"
+    assert captured[1]["prepared_wav_path"] == "/tmp/news1_0.wav"
+
+
+@pytest.mark.asyncio
+async def test_handle_waiting_prepares_intro_and_news1_then_transitions_to_intro(monkeypatch):
+    """WAITING フェーズで:
+    - intro / news1 の Gemini 生成 + TTS 合成を並列実行
+    - 60 秒待機（テストではモック化）
+    - ctx.prepared_intro / prepared_news1 に合成結果を保存
+    - INTRO フェーズへ遷移
+    """
+    import saint_graph.broadcast_loop as bl_mod
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(bl_mod.asyncio, "sleep", fake_sleep)
+
+    news_service = MagicMock()
+    item = MagicMock()
+    item.title = "Title"
+    item.content = "Content"
+    news_service.peek_current_item.return_value = item
+
+    ctx = _make_ctx(news_service=news_service)
+
+    phase = await handle_waiting(ctx)
+
+    assert phase == BroadcastPhase.INTRO
+    # intro / news1 の Gemini 生成が呼ばれた
+    ctx.saint_graph.prepare_intro_text.assert_awaited_once()
+    ctx.saint_graph.prepare_news_reading_text.assert_awaited_once_with(
+        title="Title", content="Content"
+    )
+    # 合成も 2 回（intro と news1）呼ばれた
+    assert ctx.saint_graph.prepare_sentences_synth.await_count == 2
+    # 60 秒 sleep が呼ばれた
+    assert 60 in sleep_calls or 60.0 in sleep_calls
+    # 合成結果が ctx に保存された
+    assert ctx.prepared_intro is not None
+    assert len(ctx.prepared_intro) == 1
+    assert ctx.prepared_intro[0]["file_path"] == "/tmp/0.wav"
+    assert ctx.prepared_news1 is not None
+    assert ctx.prepared_news1[0]["text"] == "本文"
+
+
+@pytest.mark.asyncio
+async def test_handle_waiting_skips_news1_when_no_news_items(monkeypatch):
+    """ニュースが 0 件のとき、 news1 の合成は呼ばれない。 intro と 60 秒待機だけ走る。"""
+    import saint_graph.broadcast_loop as bl_mod
+
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(bl_mod.asyncio, "sleep", fake_sleep)
+
+    news_service = MagicMock()
+    news_service.peek_current_item.return_value = None
+
+    ctx = _make_ctx(news_service=news_service)
+
+    phase = await handle_waiting(ctx)
+
+    assert phase == BroadcastPhase.INTRO
+    ctx.saint_graph.prepare_intro_text.assert_awaited_once()
+    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+    # intro のみ合成
+    assert ctx.saint_graph.prepare_sentences_synth.await_count == 1
+    assert ctx.prepared_intro is not None
+    assert ctx.prepared_news1 is None
 
 
 @pytest.mark.asyncio

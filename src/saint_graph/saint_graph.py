@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import traceback
-from typing import List, Optional, Any, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from google.adk import Agent
 from google.adk.runners import InMemoryRunner
@@ -119,6 +119,29 @@ class SaintGraph:
             session_id=prefetch_session_id,
             user_id="yt_news_prefetch_user",
         )
+
+    async def prepare_sentences_synth(
+        self,
+        sentences: List[Tuple[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """各 sentence の TTS 合成を queue 外で先行実行し、 結果リストを返す。
+
+        sentences: [(style, text), ...]
+        戻り値: [{"file_path", "duration", "style", "text"}, ...]
+
+        WAITING 60 秒中に intro / news1 を事前合成しておく等、 視聴者を待たせない
+        ための先行合成。 後段で `body.queue_speak(prepared_wav_path=...)` に渡す。
+        """
+        prepared: List[Dict[str, Any]] = []
+        for style, text in sentences:
+            result = await self.body.prepare_speak(text=text, style=style)
+            prepared.append({
+                "file_path": result.get("file_path", ""),
+                "duration": result.get("duration", 0.0),
+                "style": style,
+                "text": text,
+            })
+        return prepared
 
     async def play_prepared_sentences(
         self,
