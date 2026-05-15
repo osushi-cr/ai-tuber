@@ -201,6 +201,38 @@ class SaintGraph:
         template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
         await self.process_turn(template, context="QA")
 
+    async def prepare_news_finished_text(self) -> List[Tuple[str, str]]:
+        """ニュース全消化時の「読み終わり」セリフを Gemini 生成する（発話キュー投入は別）。
+
+        最後のニュース再生中に handle_news 内で裏先行で呼び、 prepare_sentences_synth
+        で wav 化したものを handle_qa 冒頭で再生する用。 prefetch 専用 session を使う。
+        """
+        template = self.templates.get("news_finished", "全てのニュースを読み上げました。")
+        self._prefetch_seq += 1
+        prefetch_session_id = f"yt_news_finished_prefetch_{self._prefetch_seq}"
+        return await self._collect_turn_sentences(
+            template,
+            context="News Finished",
+            session_id=prefetch_session_id,
+            user_id="yt_news_finished_prefetch_user",
+        )
+
+    async def prepare_qa_intro_text(self) -> List[Tuple[str, str]]:
+        """QA フェーズ開始の促進セリフを Gemini 生成する（発話キュー投入は別）。
+
+        最後のニュース再生中に handle_news 内で裏先行で呼び、 prepare_sentences_synth
+        で wav 化したものを handle_qa 冒頭で再生する用。 prefetch 専用 session を使う。
+        """
+        template = self.templates.get("qa", "みんな、コメントどうぞ〜！")
+        self._prefetch_seq += 1
+        prefetch_session_id = f"yt_qa_intro_prefetch_{self._prefetch_seq}"
+        return await self._collect_turn_sentences(
+            template,
+            context="QA Intro",
+            session_id=prefetch_session_id,
+            user_id="yt_qa_intro_prefetch_user",
+        )
+
     async def prepare_qa_chitchat_text(
         self, recent_titles: Optional[List[str]] = None
     ) -> List[Tuple[str, str]]:

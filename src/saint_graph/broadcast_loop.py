@@ -584,56 +584,64 @@ _QA_PROMPT_EVERY = int(os.getenv("BROADCAST_QA_PROMPT_EVERY", "5"))
 
 
 async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
+    """QA: コメント拾いコーナー。
+
+    - 初回 entry: content_image(qa, True) を queue し、
+      ctx.prepared_news_finished / prepared_qa_intro / prepared_qa_first を順に
+      queue_speak で投入する（handle_news が最後の news 再生中に裏で合成済）。
+    - ループ: コメント反応 or 自発雑談を行い、 沈黙が MAX_WAIT_CYCLES 続いたら
+      CLOSING へ遷移する。
     """
-    QA: コメント拾いコーナー。コメントがあれば反応し、無いときは
-    `_QA_PROMPT_EVERY` サイクル毎に「コメント募集」促進セリフを発する。
-    沈黙が `MAX_WAIT_CYCLES` 続いたら CLOSING へ遷移する。
-    """
+    # 初回 entry の準備系（content_image + 事前合成済 finished/intro/first）
     if BroadcastPhase.QA not in ctx.phase_scene_initialized:
-        main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-        ok = await _queue_scene_switch_strict(
-            ctx,
-            main_scene,
-            "QA entry scene_switch",
-        )
-        if not ok:
-            ctx.closing_reason = "technical_failure"
-            return BroadcastPhase.CLOSING
-        ctx.phase_scene_initialized.add(BroadcastPhase.QA)
-
-        # QA 画像 overlay をくららの右に表示（QA 中ずっと出す）。
-        # CLOSING に抜ける際は handle_closing 冒頭で end 画像へ上書きされる。
         try:
-            await ctx.saint_graph.body.set_content_image(image="qa")
+            await ctx.saint_graph.body.queue_content_set(image="qa", visible=True)
         except Exception as e:
-            logger.warning(f"Failed to set qa content image: {e}")
+            logger.warning(f"Failed to queue qa content_set: {e}")
 
-    # 最後の news 再生中に裏で先回り投入した QA 初手 chitchat があれば、それを再生する。
-    # 通常の poll/promote ループに入る前に消化して news → QA 遷移の沈黙を埋める。
-    if ctx.preloaded_qa_action_ids is not None:
-        action_ids = ctx.preloaded_qa_action_ids
-        ctx.preloaded_qa_action_ids = None
-        logger.info("Reading pre-queued QA first chitchat")
-        ok = await ctx.saint_graph.body.wait_for_queue_strict(action_ids=action_ids)
-        if not ok:
-            logger.warning("Pre-queued QA chitchat playback did not complete cleanly")
-        ctx.idle_counter = 0
-        ctx.qa_speak_counter += 1
+        for sentence in ctx.prepared_news_finished or []:
+            await ctx.saint_graph.body.queue_speak(
+                text=sentence.get("text", ""),
+                style=sentence.get("style"),
+                prepared_wav_path=sentence.get("file_path"),
+                prepared_duration=sentence.get("duration"),
+            )
+        for sentence in ctx.prepared_qa_intro or []:
+            await ctx.saint_graph.body.queue_speak(
+                text=sentence.get("text", ""),
+                style=sentence.get("style"),
+                prepared_wav_path=sentence.get("file_path"),
+                prepared_duration=sentence.get("duration"),
+            )
+        for sentence in ctx.prepared_qa_first or []:
+            await ctx.saint_graph.body.queue_speak(
+                text=sentence.get("text", ""),
+                style=sentence.get("style"),
+                prepared_wav_path=sentence.get("file_path"),
+                prepared_duration=sentence.get("duration"),
+            )
+
+        ctx.prepared_news_finished = None
+        ctx.prepared_qa_intro = None
+        ctx.prepared_qa_first = None
+        ctx.phase_scene_initialized.add(BroadcastPhase.QA)
         return BroadcastPhase.QA
 
-    if await _poll_and_respond(ctx):
-        ctx.idle_counter = 0
-        return BroadcastPhase.QA
-
-    ctx.idle_counter += 1
-    if ctx.idle_counter > MAX_WAIT_CYCLES:
+    # 沈黙が続いたら CLOSING
+    if ctx.idle_counter >= MAX_WAIT_CYCLES:
         logger.info(
             f"Silence timeout ({MAX_WAIT_CYCLES} cycles) reached in QA. Closing."
         )
         return BroadcastPhase.CLOSING
 
+    # コメント反応 or 自発雑談
+    if await _poll_and_respond(ctx):
+        ctx.idle_counter = 0
+        return BroadcastPhase.QA
+
+    ctx.idle_counter += 1
+
     # 一定サイクル毎に発話。3 回中 1 回はコメント促進（qa）、残り 2 回は自発雑談（qa_chitchat）。
-    # 雑談優位にすることで「コメント来てね」連発の単調さを避け、配信が自然に流れる。
     if ctx.idle_counter % _QA_PROMPT_EVERY == 1:
         ctx.qa_speak_counter += 1
         if ctx.qa_speak_counter % 3 == 0:

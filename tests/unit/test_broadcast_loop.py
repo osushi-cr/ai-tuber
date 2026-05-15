@@ -77,57 +77,6 @@ def _make_ctx(news_service=None, comments=None):
 
 
 @pytest.mark.asyncio
-async def test_handle_qa_wait():
-    ctx = _make_ctx()
-    phase = await handle_qa(ctx)
-    
-    assert phase == BroadcastPhase.QA
-    assert ctx.idle_counter == 1
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("kurara_main")
-    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with(["scene-action"])
-
-
-@pytest.mark.asyncio
-async def test_handle_qa_timeout():
-    ctx = _make_ctx()
-    ctx.idle_counter = MAX_WAIT_CYCLES
-    phase = await handle_qa(ctx)
-    
-    assert phase == BroadcastPhase.CLOSING
-
-
-@pytest.mark.asyncio
-async def test_handle_qa_queues_main_scene_only_once():
-    ctx = _make_ctx()
-
-    first = await handle_qa(ctx)
-    second = await handle_qa(ctx)
-
-    assert first == BroadcastPhase.QA
-    assert second == BroadcastPhase.QA
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("kurara_main")
-
-
-@pytest.mark.asyncio
-async def test_handle_qa_closes_when_main_scene_strict_fails():
-    ctx = _make_ctx()
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"action_id": "qa-1"},
-        {"action_id": "qa-2"},
-    ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, False]
-
-    phase = await handle_qa(ctx)
-
-    assert phase == BroadcastPhase.CLOSING
-    assert ctx.closing_reason == "technical_failure"
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["qa-1"]),
-        call(["qa-2"]),
-    ])
-
-
-@pytest.mark.asyncio
 async def test_handle_closing(monkeypatch):
     monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
     ctx = _make_ctx()
@@ -337,27 +286,6 @@ async def test_handle_intro_does_not_set_caption_for_intro_text():
         if c.kwargs.get("type") == "intro"
     ]
     assert intro_caption_calls == []
-
-
-@pytest.mark.asyncio
-async def test_handle_qa_sets_qa_content_image_on_first_entry():
-    """QA フェーズ初回入口で qa 画像を表示する。"""
-    ctx = _make_ctx()
-
-    await handle_qa(ctx)
-
-    ctx.saint_graph.body.set_content_image.assert_called_once_with(image="qa")
-
-
-@pytest.mark.asyncio
-async def test_handle_qa_does_not_reset_content_image_on_reentry():
-    """QA は loop で複数回呼ばれるが、 content 画像は初回のみ set。"""
-    ctx = _make_ctx()
-
-    await handle_qa(ctx)
-    await handle_qa(ctx)
-
-    assert ctx.saint_graph.body.set_content_image.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -640,6 +568,99 @@ async def test_handle_intro_news1_speak_has_caption_synced():
 
 
 @pytest.mark.asyncio
+async def test_handle_qa_plays_prepared_news_finished_qa_intro_qa_first_on_first_entry():
+    """QA 初回エントリで、 ctx の prepared_news_finished / prepared_qa_intro /
+    prepared_qa_first が順に queue_speak で投入され、 ctx 側はクリアされる。
+    content_image(qa, True) も queue される。
+    """
+    ctx = _make_ctx()
+    ctx.prepared_news_finished = [
+        {"file_path": "/tmp/finished.wav", "duration": 2.0, "style": "neutral", "text": "おしまい"}
+    ]
+    ctx.prepared_qa_intro = [
+        {"file_path": "/tmp/qa_intro.wav", "duration": 2.0, "style": "joyful", "text": "コメントどうぞ"}
+    ]
+    ctx.prepared_qa_first = [
+        {"file_path": "/tmp/qa_first.wav", "duration": 2.0, "style": "neutral", "text": "雑談1"}
+    ]
+
+    events = []
+
+    async def queue_content_set(image, visible):
+        events.append(("content_set", image, visible))
+        return {"action_id": f"c-{image}"}
+
+    async def queue_speak(text=None, style=None, speaker_id=None,
+                         caption_title=None, caption_summary=None,
+                         prepared_wav_path=None, prepared_duration=None):
+        events.append(("speak", prepared_wav_path))
+        return {"action_id": f"s-{prepared_wav_path}"}
+
+    ctx.saint_graph.body.queue_content_set = AsyncMock(side_effect=queue_content_set)
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+
+    await handle_qa(ctx)
+
+    # content_set(qa, True) → finished → qa_intro → qa_first の順
+    assert events == [
+        ("content_set", "qa", True),
+        ("speak", "/tmp/finished.wav"),
+        ("speak", "/tmp/qa_intro.wav"),
+        ("speak", "/tmp/qa_first.wav"),
+    ]
+    # 消化後は None
+    assert ctx.prepared_news_finished is None
+    assert ctx.prepared_qa_intro is None
+    assert ctx.prepared_qa_first is None
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_skips_prepared_on_second_entry():
+    """QA 2 回目以降の entry では prepared は既に None なので queue_speak されない。
+    content_set(qa, True) も再投入されない（初回のみ）。
+    """
+    ctx = _make_ctx()
+    # 初回処理済を模擬: phase_scene_initialized に QA 追加 + prepared は None
+    ctx.phase_scene_initialized.add(BroadcastPhase.QA)
+    ctx.prepared_news_finished = None
+    ctx.prepared_qa_intro = None
+    ctx.prepared_qa_first = None
+
+    events = []
+
+    async def queue_content_set(image, visible):
+        events.append(("content_set", image, visible))
+        return {"action_id": "c"}
+
+    async def queue_speak(**kwargs):
+        events.append(("speak", kwargs.get("prepared_wav_path")))
+        return {"action_id": "s"}
+
+    ctx.saint_graph.body.queue_content_set = AsyncMock(side_effect=queue_content_set)
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+
+    await handle_qa(ctx)
+
+    # 初期化系は走らない
+    assert ("content_set", "qa", True) not in events
+    # prepared が無いので speak も 0 件（コメント反応合成は別ループ）
+    speak_events = [e for e in events if e[0] == "speak"]
+    assert speak_events == []
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_silence_timeout_transitions_to_closing():
+    """idle_counter が MAX_WAIT_CYCLES を超えると CLOSING へ遷移する。"""
+    ctx = _make_ctx()
+    ctx.phase_scene_initialized.add(BroadcastPhase.QA)
+    ctx.idle_counter = MAX_WAIT_CYCLES
+
+    phase = await handle_qa(ctx)
+
+    assert phase == BroadcastPhase.CLOSING
+
+
+@pytest.mark.asyncio
 async def test_handle_news_uses_prepared_current_news_with_caption():
     """ctx.prepared_current_news が事前に設定されているとき、 handle_news は
     現 news 分は再合成せず prepared wav を queue_speak で投入する
@@ -835,20 +856,3 @@ async def test_handle_waiting_skips_news1_when_no_news_items(monkeypatch):
     assert ctx.prepared_news1 is None
 
 
-@pytest.mark.asyncio
-async def test_handle_qa_consumes_preloaded_chitchat():
-    """preloaded_qa_action_ids があれば handle_qa 冒頭で消化して QA フェーズに残る。"""
-    ctx = _make_ctx()
-    ctx.preloaded_qa_action_ids = ["id1", "id2"]
-    ctx.idle_counter = 5
-    ctx.qa_speak_counter = 0
-
-    phase = await handle_qa(ctx)
-
-    assert phase == BroadcastPhase.QA
-    assert ctx.preloaded_qa_action_ids is None
-    assert ctx.idle_counter == 0
-    assert ctx.qa_speak_counter == 1
-    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(action_ids=["id1", "id2"])
-    # poll/promote 系統は走らない（preloaded ルートで早期 return）
-    ctx.saint_graph.body.get_comments.assert_not_called()
