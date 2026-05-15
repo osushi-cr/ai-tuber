@@ -14,7 +14,6 @@ from saint_graph.broadcast_loop import (
     handle_qa,
     handle_closing,
     run_broadcast_loop,
-    _preload_next_news,
 )
 from saint_graph.config import MAX_WAIT_CYCLES
 
@@ -77,32 +76,6 @@ def _make_ctx(news_service=None, comments=None):
 
 
 @pytest.mark.asyncio
-async def test_handle_closing(monkeypatch):
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-    ctx = _make_ctx()
-    # asyncio.sleep をモックしてテストを高速化
-    with patch("asyncio.sleep", return_value=None):
-        phase = await handle_closing(ctx)
-
-    assert phase is None
-    ctx.saint_graph.process_closing.assert_called_once_with(reason=None)
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("ending")
-    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with(["scene-action"])
-
-
-@pytest.mark.asyncio
-async def test_handle_closing_passes_technical_failure_reason(monkeypatch):
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-    ctx = _make_ctx()
-    ctx.closing_reason = "technical_failure"
-    with patch("asyncio.sleep", return_value=None):
-        phase = await handle_closing(ctx)
-
-    assert phase is None
-    ctx.saint_graph.process_closing.assert_called_once_with(reason="technical_failure")
-
-
-@pytest.mark.asyncio
 async def test_handle_closing_holds_ending_scene_for_configured_duration(monkeypatch):
     """ending シーン切替後に BROADCAST_ENDING_DURATION 秒だけ asyncio.sleep する。"""
     monkeypatch.setenv("BROADCAST_ENDING_DURATION", "45")
@@ -140,62 +113,6 @@ async def test_handle_closing_skips_sleep_when_duration_is_zero(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_closing_uses_closing_pool_when_available(monkeypatch, tmp_path):
-    """CLOSING_POOL_DIR に closing_*.wav があれば Gemini を使わずプールから再生する。"""
-    import wave
-
-    pool_dir = tmp_path / "closings"
-    pool_dir.mkdir()
-    for i in range(1, 4):
-        wav_path = pool_dir / f"closing_{i:02d}.wav"
-        with wave.open(str(wav_path), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(16000)
-            w.writeframes(b"")
-    monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-
-    ctx = _make_ctx()
-    ctx.saint_graph.body.queue_filler = AsyncMock(
-        return_value={"action_id": "closing-action"}
-    )
-
-    phase = await handle_closing(ctx)
-
-    assert phase is None
-    # Gemini は呼ばない
-    ctx.saint_graph.process_closing.assert_not_called()
-    # プールから 1 件選ばれて queue_filler に渡される
-    ctx.saint_graph.body.queue_filler.assert_called_once()
-    call_kwargs = ctx.saint_graph.body.queue_filler.call_args.kwargs
-    assert call_kwargs["file_path"].endswith(".wav")
-    assert "closing_" in call_kwargs["file_path"]
-    # action_id を strict 待ち
-    ctx.saint_graph.body.wait_for_queue_strict.assert_any_call(
-        action_ids=["closing-action"]
-    )
-    # ending シーン切替
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("ending")
-
-
-@pytest.mark.asyncio
-async def test_handle_closing_falls_back_to_gemini_when_pool_empty(monkeypatch, tmp_path):
-    """CLOSING_POOL_DIR が存在しても wav が無ければ Gemini フォールバック。"""
-    pool_dir = tmp_path / "closings"
-    pool_dir.mkdir()
-    monkeypatch.setenv("CLOSING_POOL_DIR", str(pool_dir))
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-
-    ctx = _make_ctx()
-    with patch("asyncio.sleep", return_value=None):
-        phase = await handle_closing(ctx)
-
-    assert phase is None
-    ctx.saint_graph.process_closing.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_handle_closing_stops_auto_filler_at_entry(monkeypatch):
     """CLOSING 突入時に auto_filler_stop を queue 投入する（chitchat 割り込み防止）。"""
     monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
@@ -205,22 +122,6 @@ async def test_handle_closing_stops_auto_filler_at_entry(monkeypatch):
         await handle_closing(ctx)
 
     ctx.saint_graph.body.queue_auto_filler_stop.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_closing_continues_when_ending_scene_strict_fails(caplog, monkeypatch):
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-    caplog.set_level("WARNING", logger="saint-graph")
-    ctx = _make_ctx()
-    ctx.saint_graph.body.queue_scene_switch.return_value = {"action_id": "ending"}
-    ctx.saint_graph.body.wait_for_queue_strict.return_value = False
-
-    phase = await handle_closing(ctx)
-
-    assert phase is None
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once_with("ending")
-    ctx.saint_graph.body.wait_for_queue_strict.assert_called_once_with(["ending"])
-    assert "CLOSING ending scene_switch failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -289,22 +190,6 @@ async def test_handle_intro_does_not_set_caption_for_intro_text():
 
 
 @pytest.mark.asyncio
-async def test_handle_closing_sets_end_content_image_then_clears_before_ending_scene(monkeypatch, tmp_path):
-    """CLOSING 冒頭で end 画像、 ending scene 切替前に clear する（QA 画像を上書き）。"""
-    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
-    monkeypatch.setenv("CLOSING_POOL_DIR", str(tmp_path))
-    ctx = _make_ctx()
-
-    with patch("asyncio.sleep", return_value=None):
-        await handle_closing(ctx)
-
-    calls = ctx.saint_graph.body.set_content_image.call_args_list
-    # 1 回目: end 画像 set / 2 回目: ending 切替前に clear
-    assert calls[0] == call(image="end")
-    assert calls[-1] == call(visible=False)
-
-
-@pytest.mark.asyncio
 async def test_handle_closing_does_not_set_caption_for_closing_text(monkeypatch, tmp_path):
     """closing テキスト caption は出さず content 画像のみ。 set_caption(type=closing) を呼ばない。"""
     monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
@@ -319,120 +204,6 @@ async def test_handle_closing_does_not_set_caption_for_closing_text(monkeypatch,
         if c.kwargs.get("type") == "closing"
     ]
     assert closing_caption_calls == []
-
-
-@pytest.mark.asyncio
-async def test_preload_next_news_falls_back_to_qa_chitchat_on_last_news():
-    """最後の news 再生中（has_next=False）は QA 初手 chitchat を裏で先行投入する。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    item1 = MagicMock(); item1.title = "T1"
-    item2 = MagicMock(); item2.title = "T2"
-    news_service.items = [item1, item2]
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
-        return_value=[("neutral", "今日のニュース振り返り")]
-    )
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["qa-speak"])
-
-    await _preload_next_news(ctx)
-
-    ctx.saint_graph.prepare_qa_chitchat_text.assert_called_once_with(
-        recent_titles=["T1", "T2"]
-    )
-    ctx.saint_graph.play_prepared_sentences.assert_called_once()
-    assert ctx.preloaded_qa_action_ids == ["qa-speak"]
-    # 通常の news prefetch 経路は呼ばれない
-    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
-    # QA chitchat sentences の前に scene_switch + qa content image を投入している
-    ctx.saint_graph.body.queue_scene_switch.assert_any_call("kurara_main")
-    ctx.saint_graph.body.set_content_image.assert_any_call(image="qa")
-    # handle_qa 側で scene init を二重実行しないようマーク済
-    assert BroadcastPhase.QA in ctx.phase_scene_initialized
-
-
-@pytest.mark.asyncio
-async def test_preload_first_qa_chitchat_orders_scene_before_chitchat_enqueue():
-    """scene_switch / set_content_image は QA chitchat sentences より先に enqueue される。
-
-    body queue は順序保証のため、enqueue 順がそのまま再生順になる。
-    """
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    item1 = MagicMock(); item1.title = "T1"
-    news_service.items = [item1]
-    ctx = _make_ctx(news_service=news_service)
-    call_order: list[str] = []
-
-    async def record_scene(scene):
-        call_order.append(f"scene_switch:{scene}")
-        return {"action_id": "scene"}
-
-    async def record_image(**kwargs):
-        call_order.append(f"set_content_image:{kwargs}")
-
-    async def record_play(sentences, wait_after=True):
-        call_order.append(f"play_prepared_sentences:wait_after={wait_after}")
-        return ["qa-speak"]
-
-    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=record_scene)
-    ctx.saint_graph.body.set_content_image = AsyncMock(side_effect=record_image)
-    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
-        return_value=[("neutral", "振り返り")]
-    )
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(side_effect=record_play)
-
-    await _preload_next_news(ctx)
-
-    assert call_order == [
-        "scene_switch:kurara_main",
-        "set_content_image:{'image': 'qa'}",
-        "play_prepared_sentences:wait_after=False",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_preload_first_qa_chitchat_skips_scene_init_mark_on_scene_failure():
-    """scene_switch が失敗した場合は phase_scene_initialized に QA を add しない。
-
-    handle_qa 側で通常の scene init 経路を走らせるため。
-    """
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    item1 = MagicMock(); item1.title = "T1"
-    news_service.items = [item1]
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch = AsyncMock(
-        side_effect=RuntimeError("OBS not connected")
-    )
-    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
-        return_value=[("neutral", "x")]
-    )
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["qa-speak"])
-
-    await _preload_next_news(ctx)
-
-    # chitchat 自体は enqueue される（fallback）
-    assert ctx.preloaded_qa_action_ids == ["qa-speak"]
-    # ただし scene_switch 失敗時は scene init マークしない
-    assert BroadcastPhase.QA not in ctx.phase_scene_initialized
-
-
-@pytest.mark.asyncio
-async def test_preload_next_news_skips_qa_chitchat_when_already_preloaded():
-    """同じ has_next=False 状況で二度呼ばれても QA chitchat の二重投入は起きない。"""
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    news_service.items = []
-    ctx = _make_ctx(news_service=news_service)
-    ctx.preloaded_qa_action_ids = ["existing"]
-    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(return_value=[("neutral", "x")])
-    ctx.saint_graph.play_prepared_sentences = AsyncMock(return_value=["another"])
-
-    await _preload_next_news(ctx)
-
-    ctx.saint_graph.prepare_qa_chitchat_text.assert_not_called()
-    assert ctx.preloaded_qa_action_ids == ["existing"]
 
 
 def _ctx_with_prepared(news_service=None, prepared_intro=None, prepared_news1=None):
@@ -565,6 +336,89 @@ async def test_handle_intro_news1_speak_has_caption_synced():
     assert captured[1]["caption_title"] == "ニュースタイトル"
     assert captured[1]["caption_summary"] == "ニュース要約本文"
     assert captured[1]["prepared_wav_path"] == "/tmp/news1_0.wav"
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_queue_order(monkeypatch, tmp_path):
+    """handle_closing の enqueue 順序:
+    closing_wav → content_set(qa, false) → bgm(ed) → scene(ending) → content_set(end, true)
+    の順で worker queue に積む（視聴者目線で順序保証）。
+    最後に ending_duration 秒 sleep する。
+    """
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(tmp_path))
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "0")
+    # closing pool に 1 件
+    closing_wav = tmp_path / "closing_test.wav"
+    closing_wav.write_bytes(b"")  # 中身は無視（test では再生しない）
+
+    ctx = _make_ctx()
+
+    events = []
+
+    async def queue_filler(file_path=None, style=None, **kwargs):
+        events.append(("filler", style))
+        return {"action_id": "filler-a"}
+
+    async def queue_content_set(image, visible):
+        events.append(("content_set", image, visible))
+        return {"action_id": f"c-{image}-{visible}"}
+
+    async def queue_bgm_switch(bgm_id):
+        events.append(("bgm_switch", bgm_id))
+        return {"action_id": f"bgm-{bgm_id}"}
+
+    async def queue_scene_switch(scene):
+        events.append(("scene_switch", scene))
+        return {"action_id": f"scene-{scene}"}
+
+    async def queue_auto_filler_stop():
+        events.append(("auto_filler_stop",))
+        return {"action_id": "afs"}
+
+    ctx.saint_graph.body.queue_filler = AsyncMock(side_effect=queue_filler)
+    ctx.saint_graph.body.queue_content_set = AsyncMock(side_effect=queue_content_set)
+    ctx.saint_graph.body.queue_bgm_switch = AsyncMock(side_effect=queue_bgm_switch)
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(side_effect=queue_scene_switch)
+    ctx.saint_graph.body.queue_auto_filler_stop = AsyncMock(side_effect=queue_auto_filler_stop)
+
+    result = await handle_closing(ctx)
+
+    assert result is None
+    # auto_filler 停止 → closing wav → qa 画像非表示 → ed BGM → ending scene → end 画像表示
+    assert events == [
+        ("auto_filler_stop",),
+        ("filler", "joyful"),
+        ("content_set", "", False),
+        ("bgm_switch", "ed"),
+        ("scene_switch", "ending"),
+        ("content_set", "end", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_closing_holds_for_ending_duration(monkeypatch, tmp_path):
+    """ending_duration > 0 なら asyncio.sleep(ending_duration) で待機する。"""
+    monkeypatch.setenv("CLOSING_POOL_DIR", str(tmp_path))
+    monkeypatch.setenv("BROADCAST_ENDING_DURATION", "30")
+
+    sleep_calls = []
+
+    import saint_graph.broadcast_loop as bl_mod
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(bl_mod.asyncio, "sleep", fake_sleep)
+
+    ctx = _make_ctx()
+    ctx.saint_graph.body.queue_filler = AsyncMock(return_value={"action_id": "f"})
+    ctx.saint_graph.body.queue_content_set = AsyncMock(return_value={"action_id": "c"})
+    ctx.saint_graph.body.queue_bgm_switch = AsyncMock(return_value={"action_id": "b"})
+    ctx.saint_graph.body.queue_scene_switch = AsyncMock(return_value={"action_id": "s"})
+
+    await handle_closing(ctx)
+
+    assert 30.0 in sleep_calls or 30 in sleep_calls
 
 
 @pytest.mark.asyncio

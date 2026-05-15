@@ -38,8 +38,6 @@ class BroadcastContext:
     saint_graph: SaintGraph
     news_service: NewsService
     idle_counter: int = 0
-    # 次ニュースのプリフェッチ task（Gemini 生成済みセリフだけを保持し、speak は積まない）
-    next_news_task: Optional[asyncio.Task[List[Tuple[str, str]]]] = None
     # WAITING フェーズで事前合成した intro / news1 の prepared sentences。
     # 各要素は {"file_path", "duration", "style", "text"} の dict。
     prepared_intro: Optional[List[Dict[str, Any]]] = None
@@ -53,13 +51,6 @@ class BroadcastContext:
     prepared_news_finished: Optional[List[Dict[str, Any]]] = None
     prepared_qa_intro: Optional[List[Dict[str, Any]]] = None
     prepared_qa_first: Optional[List[Dict[str, Any]]] = None
-    # handle_intro で news1 を speak まで先回り投入したときの action_ids と原ニュース。
-    # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
-    preloaded_news_action_ids: Optional[List[str]] = None
-    preloaded_news_item: Optional[Any] = None
-    # 最後のニュース再生中に裏で先回り投入した QA 初手 chitchat の action_ids。
-    # handle_qa 冒頭でこれを検知して再生完了待ち＋通常ループ復帰する。news → QA 遷移の沈黙短縮用。
-    preloaded_qa_action_ids: Optional[List[str]] = None
     # QA フェーズでの発話回数。qa（コメント促進）と qa_chitchat（自発雑談）を 1:2 で
     # 交互ローテーションするためのカウンタ。
     qa_speak_counter: int = 0
@@ -239,105 +230,6 @@ async def _queue_caption_clear_strict(ctx: BroadcastContext) -> bool:
         ctx.saint_graph.body.queue_caption_clear,
         "broadcast startup caption_clear",
     )
-
-
-async def _preload_first_qa_chitchat(ctx: BroadcastContext) -> None:
-    """最後のニュース再生中に QA 初手 chitchat を裏で Gemini 取得→ enqueue する。
-
-    最後の news 再生中は `_preload_next_news` の「次ニュース」対象が無いため、その
-    タイミングで代わりに QA 初手の振り返り chitchat を先行投入する。
-
-    body queue は順序保証で「現 news → 次 enqueue」を自動連結再生するため、QA
-    chitchat sentences だけ enqueue すると news scene/image のまま QA 音声が
-    流れてしまう。これを避けるため、QA chitchat の **前** に scene_switch ＋
-    qa content image を enqueue し、handle_qa 側の scene init をスキップさせる。
-
-    handle_qa 冒頭で `ctx.preloaded_qa_action_ids` を検知して再生完了待ち→クリア。
-    """
-    if ctx.preloaded_qa_action_ids is not None:
-        return
-    recent_titles = [item.title for item in ctx.news_service.items]
-    logger.info(
-        "Pre-queueing QA scene + first chitchat during last news playback"
-    )
-    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-    scene_synced = True
-    try:
-        await ctx.saint_graph.body.queue_scene_switch(main_scene)
-    except Exception as e:
-        logger.warning(f"Pre-queue QA scene switch failed: {e}")
-        scene_synced = False
-    try:
-        await ctx.saint_graph.body.set_content_image(image="qa")
-    except Exception as e:
-        logger.warning(f"Pre-queue QA content image failed: {e}")
-        scene_synced = False
-
-    try:
-        sentences = await ctx.saint_graph.prepare_qa_chitchat_text(
-            recent_titles=recent_titles
-        )
-        if not sentences:
-            logger.warning("QA first chitchat prefetch returned empty sentences")
-            return
-        # last news の caption が QA chitchat 再生中に残らないよう、speak enqueue 前にクリア。
-        # body キューは順次処理なので、chitchat 音声が始まる時点で caption は消えている。
-        try:
-            await ctx.saint_graph.body.clear_news_caption()
-        except Exception as e:
-            logger.warning(f"Pre-queue QA caption clear failed: {e}")
-        action_ids = await ctx.saint_graph.play_prepared_sentences(
-            sentences, wait_after=False
-        )
-        if not action_ids:
-            logger.warning("QA first chitchat pre-queue did not return action_ids")
-            return
-        ctx.preloaded_qa_action_ids = action_ids
-        if scene_synced:
-            # handle_qa 側で scene init を二重実行しないようマーク。
-            ctx.phase_scene_initialized.add(BroadcastPhase.QA)
-    except Exception as e:
-        logger.warning(f"Pre-queue QA first chitchat failed: {e}")
-
-
-async def _preload_next_news(ctx: BroadcastContext) -> None:
-    """次のニュースを Gemini 取得→speak action 先行 enqueue まで一気に進める。
-
-    現ニュース再生中に裏で呼ぶことで、body の「speak enqueue 時点で TTS 合成 task 背景開始」
-    機構が活きる。enqueue が早いほど現再生終了時点で次合成が完了している割合が増え、
-    ニュース間の沈黙が縮む。失敗してもループは継続させる（次ループの通常ルートで再試行）。
-
-    最後のニュース再生中で次ニュースが無い場合は、代わりに QA 初手 chitchat を裏で
-    Gemini 取得→ enqueue して news → QA 遷移の沈黙を埋める。
-    """
-    if not ctx.news_service.has_next():
-        await _preload_first_qa_chitchat(ctx)
-        return
-    next_item = ctx.news_service.peek_current_item()
-    if next_item is None:
-        return
-
-    logger.info(f"Pre-queueing next news during current playback: {next_item.title}")
-    try:
-        next_sentences = await ctx.saint_graph.prepare_news_reading_text(
-            title=next_item.title, content=next_item.content
-        )
-        if not next_sentences:
-            logger.warning("next news prefetch returned empty sentences")
-            return
-        next_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
-            next_sentences,
-            caption_title=next_item.title,
-            caption_summary=next_item.content,
-            wait_after=False,
-        )
-        if not next_action_ids:
-            logger.warning("next news pre-queue did not return action_ids")
-            return
-        ctx.preloaded_news_action_ids = next_action_ids
-        ctx.preloaded_news_item = next_item
-    except Exception as e:
-        logger.warning(f"Pre-queue next news failed: {e}")
 
 
 async def _poll_and_respond(ctx: BroadcastContext) -> bool:
@@ -663,79 +555,67 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
 
 
 async def handle_closing(ctx: BroadcastContext) -> BroadcastPhase:
-    """CLOSING: 事前生成 closing wav プールからランダム選択して再生する。
+    """CLOSING: 〆コメント（事前録音 wav）→ QA 画像非表示 → ending BGM → ending シーン
+    → end 画像表示 → 60s 余韻 → ループ終了。
 
-    プール (`CLOSING_POOL_DIR` / data/mind/kurara/closings/closing_*.wav) が
-    空の場合は従来通り Gemini で生成して再生する。
-    None を返しループ終了。
-
-    auto_filler は CLOSING 突入時に停止する。 closing speech / ending 60s
-    の余韻に chitchat が割り込むのを防ぐ。
+    すべて worker queue を通して順序保証する。 auto_filler は CLOSING 突入時に停止
+    （closing 再生 / 60s 余韻に chitchat が割り込むのを防ぐ）。
     """
-    # auto_filler を即停止（chitchat 割り込み防止）。 失敗しても致命ではない。
+    # auto_filler 停止
     try:
         await ctx.saint_graph.body.queue_auto_filler_stop()
     except Exception as e:
         logger.warning(f"Failed to queue auto_filler_stop at CLOSING: {e}")
 
-    # end 画像 overlay をくららの右に表示（closing pool 再生中のみ。
-    # ending シーン切替直前に clear する）。 QA 画像は上書きされる。
-    try:
-        await ctx.saint_graph.body.set_content_image(image="end")
-    except Exception as e:
-        logger.warning(f"Failed to set end content image: {e}")
-
+    # 〆コメント（事前録音 wav）を再生。 プール (`CLOSING_POOL_DIR`) からランダム選択。
     closings_dir = Path(os.getenv("CLOSING_POOL_DIR", "data/mind/kurara/closings"))
     candidates = (
         sorted(closings_dir.glob("closing_*.wav")) if closings_dir.exists() else []
     )
-
     if candidates:
         chosen = random.choice(candidates)
         logger.info(f"Closing: playing pre-generated wav: {chosen.name}")
         try:
-            result = await ctx.saint_graph.body.queue_filler(
+            await ctx.saint_graph.body.queue_filler(
                 file_path=str(chosen), style="joyful"
             )
-            action_id = (
-                result.get("action_id") if isinstance(result, dict) else None
-            )
-            if action_id:
-                await ctx.saint_graph.body.wait_for_queue_strict(
-                    action_ids=[action_id]
-                )
         except Exception as e:
-            logger.warning(
-                f"Closing pool playback failed ({e}), falling back to Gemini"
-            )
-            await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
+            logger.warning(f"Closing pool playback failed: {e}")
     else:
-        logger.info("Closing pool not found, generating via Gemini")
-        await ctx.saint_graph.process_closing(reason=ctx.closing_reason)
+        logger.info("Closing pool empty; skip wav playback (queue order is still preserved)")
 
-    # ending シーン切替前に end 画像 overlay を畳む（ending では画像出さない）。
+    # QA 画像非表示（〆 wav が終わった頃に画面から QA overlay が消える）
     try:
-        await ctx.saint_graph.body.set_content_image(visible=False)
+        await ctx.saint_graph.body.queue_content_set(image="", visible=False)
     except Exception as e:
-        logger.warning(f"Failed to clear end content image: {e}")
+        logger.warning(f"Failed to queue qa content hide: {e}")
 
-    # 配信終了画面へシーン切替（ending イラスト＋BGM）
+    # ending BGM へ切替
+    try:
+        await ctx.saint_graph.body.queue_bgm_switch("ed")
+    except Exception as e:
+        logger.warning(f"Failed to queue bgm 'ed': {e}")
+
+    # ending シーン切替
     ending_scene = os.getenv("BROADCAST_ENDING_SCENE", "ending")
-    await _queue_and_wait_strict_once(
-        ctx,
-        lambda: ctx.saint_graph.body.queue_scene_switch(ending_scene),
-        "CLOSING ending scene_switch",
-    )
+    try:
+        await ctx.saint_graph.body.queue_scene_switch(ending_scene)
+    except Exception as e:
+        logger.warning(f"Failed to queue ending scene_switch: {e}")
 
-    # ending BGM (ed) を一定時間流して余韻を残してから配信終了。
-    # CLOSING フェーズ突入時に _switch_bgm_for_phase で既に "ed" が再生されているので、
-    # ここでは指定秒数だけ画面を保持するだけで良い。
+    # end 画像表示（ending シーンに移ってから表示）
+    try:
+        await ctx.saint_graph.body.queue_content_set(image="end", visible=True)
+    except Exception as e:
+        logger.warning(f"Failed to queue end content_set: {e}")
+
+    # 余韻 sleep（環境変数で 0 にすると即終了）
     ending_duration = float(os.getenv("BROADCAST_ENDING_DURATION", "60"))
     if ending_duration > 0:
         logger.info(f"Holding ending scene with BGM for {ending_duration}s before exit")
         await asyncio.sleep(ending_duration)
 
-    return None  # ループ終了のシグナル
+    return None  # ループ終了
 
 
 # ---------------------------------------------------------------------------
@@ -752,14 +632,15 @@ _HANDLERS = {
 
 # フェーズと BGM の対応。 obs_adapter.BGM_SOURCES の bgm_id と一致させる。
 _PHASE_BGM = {
-    # WAITING / INTRO / NEWS の BGM は各ハンドラ内で queue 経由で切替するため None。
+    # WAITING / INTRO / NEWS / CLOSING の BGM は各ハンドラ内で queue 経由で切替するため None。
     # WAITING は OBS の waiting シーン側で chitchat BGM を流す前提（body は触らない）。
     # INTRO は handle_intro 冒頭で op → 終盤で news を queue に積む。
+    # CLOSING は handle_closing 内で〆 wav 再生後に ed BGM を queue に積む。
     BroadcastPhase.WAITING: None,
     BroadcastPhase.INTRO:   None,
     BroadcastPhase.NEWS:    None,
     BroadcastPhase.QA:      "chitchat",
-    BroadcastPhase.CLOSING: "ed",
+    BroadcastPhase.CLOSING: None,
 }
 
 async def _switch_bgm_for_phase(
@@ -778,17 +659,6 @@ async def _switch_bgm_for_phase(
         await ctx.saint_graph.body.switch_bgm(bgm_id)
     except Exception as e:
         logger.warning(f"Failed to switch BGM for phase {phase.value}: {e}")
-
-
-async def _cancel_pending_tasks(ctx: BroadcastContext) -> None:
-    """ループ終了時に未完了の prefetch task をキャンセルしてリーク防止する。"""
-    if ctx.next_news_task is not None and not ctx.next_news_task.done():
-        ctx.next_news_task.cancel()
-        try:
-            await ctx.next_news_task
-        except (asyncio.CancelledError, Exception):
-            pass
-    ctx.next_news_task = None
 
 
 async def run_broadcast_loop(ctx: BroadcastContext) -> None:
@@ -844,4 +714,3 @@ async def run_broadcast_loop(ctx: BroadcastContext) -> None:
             ctx.saint_graph.body.queue_auto_filler_stop,
             "broadcast shutdown auto_filler_stop",
         )
-        await _cancel_pending_tasks(ctx)
