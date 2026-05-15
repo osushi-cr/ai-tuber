@@ -469,6 +469,45 @@ async def test_handle_qa_plays_prepared_news_finished_qa_intro_qa_first_on_first
 
 
 @pytest.mark.asyncio
+async def test_handle_qa_first_entry_clears_news_caption_before_news_finished_speak():
+    """QA 初回 entry で content_set(qa, True) の直後、 news_finished speak の前に
+    queue_caption_clear が呼ばれる（最後の news caption が news_finished 再生中に
+    残らないようにする）。
+    """
+    ctx = _make_ctx()
+    ctx.prepared_news_finished = [
+        {"file_path": "/tmp/f.wav", "duration": 1.0, "style": "neutral", "text": "おしまい"}
+    ]
+
+    events = []
+
+    async def queue_content_set(image, visible):
+        events.append(("content_set", image, visible))
+        return {"action_id": "c"}
+
+    async def queue_caption_clear():
+        events.append(("caption_clear",))
+        return {"action_id": "cc"}
+
+    async def queue_speak(**kwargs):
+        events.append(("speak", kwargs.get("prepared_wav_path")))
+        return {"action_id": "s"}
+
+    ctx.saint_graph.body.queue_content_set = AsyncMock(side_effect=queue_content_set)
+    ctx.saint_graph.body.queue_caption_clear = AsyncMock(side_effect=queue_caption_clear)
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+
+    await handle_qa(ctx)
+
+    # content_set(qa, True) → caption_clear → news_finished speak の順
+    assert events[:3] == [
+        ("content_set", "qa", True),
+        ("caption_clear",),
+        ("speak", "/tmp/f.wav"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_qa_skips_prepared_on_second_entry():
     """QA 2 回目以降の entry では prepared は既に None なので queue_speak されない。
     content_set(qa, True) も再投入されない（初回のみ）。

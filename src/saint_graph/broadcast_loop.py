@@ -491,6 +491,14 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
         except Exception as e:
             logger.warning(f"Failed to queue qa content_set: {e}")
 
+        # 最後の news の caption が news_finished speak 中に残らないよう、 先に
+        # caption clear を queue。 body queue は順次処理のため news_finished
+        # speak の前に確実に caption が消える。
+        try:
+            await ctx.saint_graph.body.queue_caption_clear()
+        except Exception as e:
+            logger.warning(f"Failed to queue caption clear at QA entry: {e}")
+
         for sentence in ctx.prepared_news_finished or []:
             await ctx.saint_graph.body.queue_speak(
                 text=sentence.get("text", ""),
