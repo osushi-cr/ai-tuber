@@ -79,8 +79,14 @@ class BodyClient:
         speaker_id: Optional[int] = None,
         caption_title: Optional[str] = None,
         caption_summary: Optional[str] = None,
+        prepared_wav_path: Optional[str] = None,
+        prepared_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """発話 action を queue に投入し、action_id を含むレスポンスを返す。"""
+        """発話 action を queue に投入し、action_id を含むレスポンスを返す。
+
+        prepared_wav_path / prepared_duration を渡すと body 側は事前合成済 wav を
+        再生する（waiting 60秒中に prepare_speak で合成しておいた wav を後段で再生する用）。
+        """
         payload = {"text": text}
         if style:
             payload["style"] = style
@@ -90,7 +96,33 @@ class BodyClient:
             payload["caption_title"] = caption_title
         if caption_summary is not None:
             payload["caption_summary"] = caption_summary
+        if prepared_wav_path is not None:
+            payload["prepared_wav_path"] = prepared_wav_path
+        if prepared_duration is not None:
+            payload["prepared_duration"] = prepared_duration
         return await self._queue_request("/api/speak", payload)
+
+    async def prepare_speak(
+        self,
+        text: str,
+        style: str = "neutral",
+        speaker_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """TTS 合成を queue 外で先行実行する。 戻り値は {file_path, duration}。
+
+        waiting 60秒中に intro / news1 を事前合成しておくなど、 視聴者を待たせない
+        ための先行合成用 API。 結果の file_path / duration を `queue_speak` に
+        `prepared_wav_path` / `prepared_duration` として渡して再生する。
+        """
+        payload = {
+            "text": text,
+            "style": style,
+            "speaker_id": speaker_id,
+        }
+        data = await self._request("POST", "/api/speak/prepare", payload)
+        if data:
+            return data
+        return {"file_path": "", "duration": 0.0}
 
     async def speak(
         self,
@@ -211,25 +243,35 @@ class BodyClient:
             return data.get("result", "caption updated")
         return "Error: Failed to update caption"
 
-    async def set_content_image(
+    async def queue_content_set(self, image: str = "", visible: bool = True) -> Dict[str, Any]:
+        """content 画像 overlay 更新を queue に投入し、 action_id を含むレスポンスを返す。"""
+        return await self._queue_request(
+            "/api/content/set",
+            {"image": image, "visible": visible},
+        )
+
+    async def update_content_image(
         self,
         image: str = "",
         visible: bool = True,
     ) -> str:
-        """OBS ブラウザソース経由で表示する content 画像 overlay を更新する。
+        """OBS ブラウザソース経由で表示する content 画像 overlay を更新する（queue 経由で
+        順序保証）。
 
         image:
           - "intro" / "qa" / "end" / ""（非表示）
         画像本体は data/mind/kurara/assets/contents/{image}.png。
         """
-        data = await self._request(
-            "POST",
-            "/api/content/set",
-            {"image": image, "visible": visible},
-        )
-        if data:
-            return data.get("result", "content updated")
-        return "Error: Failed to update content image"
+        data = await self.queue_content_set(image=image, visible=visible)
+        return data.get("result", f"content set to '{image}' queued")
+
+    async def set_content_image(
+        self,
+        image: str = "",
+        visible: bool = True,
+    ) -> str:
+        """互換性のため残す既存呼出口。 内部は queue 経由の `update_content_image` と同じ。"""
+        return await self.update_content_image(image=image, visible=visible)
 
     async def play_filler(
         self,

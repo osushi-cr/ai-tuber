@@ -109,19 +109,8 @@ class StreamerBodyService(BodyServiceBase):
         """現在の caption 状態を返す（OBS ブラウザソースのポーリング用）。"""
         return dict(self._caption_state)
 
-    async def set_content(
-        self,
-        image: str = "",
-        visible: bool = True,
-    ) -> str:
-        """OBS ブラウザソース経由で表示する content 画像 overlay 状態を更新する。
-
-        image:
-          - "intro" : INTRO 挨拶中（kurara_main 上にイントロ画像）
-          - "qa"    : QA フェーズ中（コメント拾いコーナー）
-          - "end"   : CLOSING 中（closing pool 再生中）
-          - ""      : 非表示
-        """
+    def _set_content_state(self, image: str, visible: bool) -> None:
+        """内部 _content_state を即時更新する（worker から呼ばれる実体）。"""
         self._content_state = {
             "image": image,
             "visible": visible if image else False,
@@ -130,7 +119,26 @@ class StreamerBodyService(BodyServiceBase):
         logger.info(
             f"[content_state] image={image or '(empty)'} visible={self._content_state['visible']}"
         )
-        return "content updated"
+
+    async def set_content(
+        self,
+        image: str = "",
+        visible: bool = True,
+    ) -> Dict[str, Any]:
+        """content 画像 overlay の更新を queue に積む（順序保証のため speak/scene/bgm
+        と同じ worker queue を通す）。
+
+        image:
+          - "intro" : INTRO 挨拶中（kurara_main 上にイントロ画像）
+          - "qa"    : QA フェーズ中（コメント拾いコーナー）
+          - "end"   : CLOSING 中（closing pool 再生中）
+          - ""      : 非表示
+        """
+        return await self._enqueue_action(
+            "content_set",
+            {"image": image, "visible": visible},
+            f"content set to '{image}' (visible={visible}) queued",
+        )
 
     def get_content_state(self) -> Dict[str, Any]:
         """現在の content 画像 overlay 状態を返す（OBS ブラウザソースのポーリング用）。"""
@@ -186,7 +194,8 @@ class StreamerBodyService(BodyServiceBase):
         self._remember_task_status(action_id, "pending", task_type, payload)
         # speak は合成を queue 投入時点で背景で開始する（再生 worker と並行に進む）。
         # これにより後続 speak の合成が現発話の再生中に裏で完了し、再生間ギャップが縮む。
-        if task_type == "speak":
+        # ただし prepared_wav_path 指定時は事前合成済なので新規合成 task は起動しない。
+        if task_type == "speak" and not payload.get("prepared_wav_path"):
             text = payload.get("text", "")
             style = payload.get("style", "neutral")
             speaker_id = payload.get("speaker_id")
@@ -332,6 +341,11 @@ class StreamerBodyService(BodyServiceBase):
             await self._start_auto_filler_task()
         elif task_type == "auto_filler_stop":
             await self._stop_auto_filler_task()
+        elif task_type == "content_set":
+            self._set_content_state(
+                image=task.get("image", ""),
+                visible=task.get("visible", True),
+            )
         else:
             raise RuntimeError(f"unknown action type: {task_type}")
 
@@ -342,10 +356,16 @@ class StreamerBodyService(BodyServiceBase):
         caption_title = task.get("caption_title")
         caption_summary = task.get("caption_summary")
         synth_task = task.get("_synth_task")
+        prepared_wav_path = task.get("prepared_wav_path")
+        prepared_duration = task.get("prepared_duration")
 
-        # 1. 音声生成: enqueue 時点で背景開始済みなら結果を待つだけ。後続 speak の合成は
-        #    本タスクの再生中に裏で並行進行し、ニュース内・ニュース間ギャップが縮む。
-        if synth_task is not None:
+        # 1. 音声生成: prepared_wav_path 指定時は事前合成済 wav を直接使う（waiting 中の
+        #    先行合成経路）。 未指定時は enqueue 時点で背景開始済みの synth_task を待つ、
+        #    または同期合成にフォールバック。
+        if prepared_wav_path is not None:
+            file_path = prepared_wav_path
+            duration = prepared_duration if prepared_duration is not None else 0.0
+        elif synth_task is not None:
             file_path, duration = await synth_task
         else:
             file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
@@ -388,6 +408,21 @@ class StreamerBodyService(BodyServiceBase):
         await obs_adapter.set_visible_source("silent")
         logger.info(f"[Worker:filler] Completed: {Path(file_path).name}")
 
+    async def prepare_speak(
+        self,
+        text: str,
+        style: str = "neutral",
+        speaker_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """TTS 合成を queue 外で即時実行し、 合成済 wav のパスと duration を返す。
+
+        waiting 60秒中に intro / news1 を事前合成しておくなど、 視聴者を待たせない
+        ための先行合成用 API。 合成結果の wav パスを `speak(prepared_wav_path=...)` に
+        渡して再生する。
+        """
+        file_path, duration = await voice_adapter.generate_and_save(text, style, speaker_id)
+        return {"file_path": file_path, "duration": duration}
+
     async def speak(
         self,
         text: str,
@@ -395,14 +430,22 @@ class StreamerBodyService(BodyServiceBase):
         speaker_id: Optional[int] = None,
         caption_title: Optional[str] = None,
         caption_summary: Optional[str] = None,
+        prepared_wav_path: Optional[str] = None,
+        prepared_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """視聴者に対してテキストを発話します (キューに追加して即時復帰)。"""
+        """視聴者に対してテキストを発話します (キューに追加して即時復帰)。
+
+        prepared_wav_path 指定時は事前合成済 wav をそのまま再生する。
+        prepared_duration は再生時間の見積もり（未指定時は 0.0 で再生）。
+        """
         result = await self._enqueue_action("speak", {
             "text": text,
             "style": style,
             "speaker_id": speaker_id,
             "caption_title": caption_title,
             "caption_summary": caption_summary,
+            "prepared_wav_path": prepared_wav_path,
+            "prepared_duration": prepared_duration,
         }, "Speech queued")
         logger.info(f"[speak:queued] '{text[:30]}...'")
         return result

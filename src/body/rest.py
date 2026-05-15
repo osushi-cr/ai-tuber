@@ -42,16 +42,33 @@ class BodyApp:
             speaker_id = body.get("speaker_id")
             caption_title = body.get("caption_title")
             caption_summary = body.get("caption_summary")
+            prepared_wav_path = body.get("prepared_wav_path")
+            prepared_duration = body.get("prepared_duration")
             result = await self.service.speak(
                 text,
                 style,
                 speaker_id,
                 caption_title=caption_title,
                 caption_summary=caption_summary,
+                prepared_wav_path=prepared_wav_path,
+                prepared_duration=prepared_duration,
             )
             return self._ok_result(result)
         except Exception as e:
             logger.error(f"Error in speak API: {e}")
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+    async def speak_prepare_api(self, request: Request) -> JSONResponse:
+        """TTS 合成を queue 外で先行実行し、 wav file_path / duration を返す。"""
+        try:
+            body = await request.json()
+            text = body.get("text", "")
+            style = body.get("style", "neutral")
+            speaker_id = body.get("speaker_id")
+            result = await self.service.prepare_speak(text, style, speaker_id)
+            return JSONResponse({"status": "ok", **result})
+        except Exception as e:
+            logger.error(f"Error in speak/prepare API: {e}")
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
     async def change_emotion_api(self, request: Request) -> JSONResponse:
@@ -302,7 +319,9 @@ class BodyApp:
         )
 
     async def content_set_api(self, request: Request) -> JSONResponse:
-        """content 画像 overlay 状態を更新する（image: intro / qa / end / ""）。"""
+        """content 画像 overlay 更新を queue に投入する（image: intro / qa / end / ""）。
+        speak / scene / bgm と同じ worker queue を通すことで順序保証する。
+        """
         try:
             body = await request.json()
             result = await self.service.set_content(
@@ -319,6 +338,7 @@ class BodyApp:
         return [
             Route("/health", self.health_check, methods=["GET"]),
             Route("/api/speak", self.speak_api, methods=["POST"]),
+            Route("/api/speak/prepare", self.speak_prepare_api, methods=["POST"]),
             Route("/api/change_emotion", self.change_emotion_api, methods=["POST"]),
             Route("/api/comments", self.peek_comments_api, methods=["GET"]),
             Route("/api/comments/consume", self.consume_comments_api, methods=["POST"]),

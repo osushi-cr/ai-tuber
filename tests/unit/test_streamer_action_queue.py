@@ -399,30 +399,164 @@ async def test_wait_for_queue_strict_detects_second_speak_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_set_content_updates_state_and_visibility():
-    """set_content() で _content_state が更新され、 image 空のときは visible が強制 False。"""
+async def test_prepare_speak_returns_wav_path_without_queue(monkeypatch):
+    """`prepare_speak` は voice_adapter.generate_and_save を queue 外で即時実行し、
+    file_path と duration を返す。 action queue には何も積まれない。
+    """
+    calls = []
+
+    async def generate_and_save(text, style, speaker_id):
+        calls.append((text, style, speaker_id))
+        return "/tmp/prepared.wav", 12.34
+
+    monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
+
     svc = StreamerBodyService()
+    result = await svc.prepare_speak("こんにちは", style="joyful", speaker_id=None)
 
-    initial = svc.get_content_state()
-    assert initial == {"image": "", "visible": False, "updated_at": 0.0}
+    assert result == {"file_path": "/tmp/prepared.wav", "duration": 12.34}
+    assert calls == [("こんにちは", "joyful", None)]
+    # queue 外で実行されるため worker queue は空
+    assert svc._action_queue.qsize() == 0
 
-    await svc.set_content(image="intro")
-    state = svc.get_content_state()
-    assert state["image"] == "intro"
-    assert state["visible"] is True
-    assert state["updated_at"] > 0.0
 
-    await svc.set_content(image="qa")
-    assert svc.get_content_state()["image"] == "qa"
+@pytest.mark.asyncio
+async def test_speak_with_prepared_wav_skips_synthesis(monkeypatch, tmp_path):
+    """speak action に prepared_wav_path / prepared_duration 指定時、
+    _handle_speak_action は voice_adapter.generate_and_save を呼ばず、
+    prepared_wav_path を直接再生する（waiting 中の先行合成結果を再生する経路）。
+    """
+    generated = []
+    played = []
 
-    # visible=False を渡すと image があっても visible False
-    await svc.set_content(image="end", visible=False)
-    assert svc.get_content_state()["visible"] is False
+    async def generate_and_save(text, style, speaker_id):
+        generated.append(text)
+        return "/tmp/never_called.wav", 0.0
 
-    # image="" は visible 強制 False（クリア用途）
-    await svc.set_content(image="", visible=True)
-    assert svc.get_content_state() == {
-        "image": "",
-        "visible": False,
-        "updated_at": svc.get_content_state()["updated_at"],
-    }
+    async def play_audio(self, file_path, duration, style):
+        played.append((file_path, duration, style))
+        return True
+
+    async def set_visible_source(emotion):
+        return "ok"
+
+    monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
+    monkeypatch.setattr(service_module.obs_adapter, "set_visible_source", set_visible_source)
+    monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
+
+    prepared_wav = tmp_path / "prepared.wav"
+    _write_empty_wav(prepared_wav)
+
+    svc = StreamerBodyService()
+    await svc.start_worker()
+    try:
+        result = await svc.speak(
+            "本文",
+            style="neutral",
+            prepared_wav_path=str(prepared_wav),
+            prepared_duration=5.0,
+        )
+
+        assert await svc.wait_for_queue_strict([result["action_id"]]) is True
+        # 合成は呼ばれない
+        assert generated == []
+        # 事前合成済 wav を直接再生
+        assert played == [(str(prepared_wav), 5.0, "neutral")]
+    finally:
+        await svc.stop_worker()
+
+
+@pytest.mark.asyncio
+async def test_set_content_updates_state_and_visibility():
+    """set_content() は queue に content_set task を積み、 worker が _content_state を
+    更新する。 image 空のときは visible が強制 False。
+    """
+    svc = StreamerBodyService()
+    await svc.start_worker()
+    try:
+        initial = svc.get_content_state()
+        assert initial == {"image": "", "visible": False, "updated_at": 0.0}
+
+        r1 = await svc.set_content(image="intro")
+        assert await svc.wait_for_queue_strict([r1["action_id"]]) is True
+        state = svc.get_content_state()
+        assert state["image"] == "intro"
+        assert state["visible"] is True
+        assert state["updated_at"] > 0.0
+
+        r2 = await svc.set_content(image="qa")
+        assert await svc.wait_for_queue_strict([r2["action_id"]]) is True
+        assert svc.get_content_state()["image"] == "qa"
+
+        # visible=False を渡すと image があっても visible False
+        r3 = await svc.set_content(image="end", visible=False)
+        assert await svc.wait_for_queue_strict([r3["action_id"]]) is True
+        assert svc.get_content_state()["visible"] is False
+
+        # image="" は visible 強制 False（クリア用途）
+        r4 = await svc.set_content(image="", visible=True)
+        assert await svc.wait_for_queue_strict([r4["action_id"]]) is True
+        final = svc.get_content_state()
+        assert final["image"] == ""
+        assert final["visible"] is False
+    finally:
+        await svc.stop_worker()
+
+
+@pytest.mark.asyncio
+async def test_content_set_action_processed_in_queue_order(monkeypatch, tmp_path):
+    """content_set が scene_switch / speak / bgm_switch と同じ worker queue で
+    順序保証されること。 不具合③（intro 画像が news1 開始時に残る）の修正検証。
+    """
+    events = []
+    filler_file = tmp_path / "filler_aizuchi_001.wav"
+    _write_empty_wav(filler_file)
+    monkeypatch.setattr(service_module, "FILLER_VOICE_DIR", tmp_path)
+
+    async def switch_scene(scene):
+        events.append(("scene_switch", scene))
+        return True
+
+    async def switch_bgm(bgm_id):
+        events.append(("bgm_switch", bgm_id))
+        return True
+
+    async def generate_and_save(text, style, speaker_id):
+        return "/tmp/test.wav", 0.0
+
+    async def play_audio(self, file_path, duration, style):
+        events.append(("speak_played", svc.get_content_state()["image"]))
+        return True
+
+    async def set_visible_source(emotion):
+        return "ok"
+
+    monkeypatch.setattr(service_module.obs_adapter, "switch_scene", switch_scene)
+    monkeypatch.setattr(service_module.obs_adapter, "switch_bgm", switch_bgm)
+    monkeypatch.setattr(service_module.voice_adapter, "generate_and_save", generate_and_save)
+    monkeypatch.setattr(service_module.obs_adapter, "set_visible_source", set_visible_source)
+    monkeypatch.setattr(StreamerBodyService, "play_audio_with_sync_emotion", play_audio)
+
+    svc = StreamerBodyService()
+    await svc.start_worker()
+    try:
+        # intro 画像表示 → intro 発話 → intro 画像を畳む → BGM 切替 → news1 発話
+        # の順で enqueue。 視聴者目線では「news1 発話開始時点で intro 画像が消えてる」必要。
+        results = [
+            await svc.set_content(image="intro", visible=True),
+            await svc.speak("こんにちは", style="joyful"),
+            await svc.set_content(image="", visible=False),
+            await svc.switch_bgm("news"),
+            await svc.speak("ニュース本文", style="neutral"),
+        ]
+        action_ids = [r["action_id"] for r in results]
+
+        assert await svc.wait_for_queue_strict(action_ids) is True
+        # intro speak 時点で content_image="intro"、news1 speak 時点で content_image=""
+        assert events == [
+            ("speak_played", "intro"),
+            ("bgm_switch", "news"),
+            ("speak_played", ""),
+        ]
+    finally:
+        await svc.stop_worker()
