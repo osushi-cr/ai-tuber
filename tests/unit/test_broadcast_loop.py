@@ -38,6 +38,11 @@ def _make_ctx(news_service=None, comments=None):
             for i, s in enumerate(sentences)
         ]
     )
+    # NEWS フェーズで news_finished / QA 開始 / QA 初手 chitchat の Gemini 生成。
+    # 既定で 1 文ずつ返す。 prepare_sentences_synth で wav 化される前提。
+    mock_saint.prepare_news_finished_text = AsyncMock(return_value=[("neutral", "おしまい")])
+    mock_saint.prepare_qa_intro_text = AsyncMock(return_value=[("joyful", "コメントどうぞ〜")])
+    mock_saint.prepare_qa_chitchat_text = AsyncMock(return_value=[("neutral", "雑談")])
     mock_saint.process_news_finished = AsyncMock()
     mock_saint.process_closing = AsyncMock()
     
@@ -69,361 +74,6 @@ def _make_ctx(news_service=None, comments=None):
         saint_graph=mock_saint,
         news_service=mock_news,
     )
-
-
-@pytest.mark.asyncio
-async def test_handle_news_with_comment():
-    """次ニュース prefetch が未完了時は、 コメントが来てたら反応 turn で時間稼ぎする。"""
-    ctx = _make_ctx(comments=[{"author": "User", "message": "Hi?"}])
-    # next_news_task が None なら next_ready=False → コメント反応経路
-    assert ctx.next_news_task is None
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    # コメント応答は process_turn を直接呼ぶ（共通ユーティリティ）
-    ctx.saint_graph.process_turn.assert_called_once()
-    assert "User: Hi" in ctx.saint_graph.process_turn.call_args[0][0]
-    ctx.saint_graph.process_news_reading.assert_not_called()
-    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_skips_comment_when_prefetch_is_ready():
-    """次ニュースの prefetch task が done なら、 コメント拾いをスキップして即ニュース読み上げに進む。"""
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-    news_service.get_next_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service, comments=[
-        {"author": "User", "message": "気になる！"},
-    ])
-
-    # prefetch task を「即完了する future」として用意（done=True）
-    ready_future: asyncio.Future = asyncio.Future()
-    ready_future.set_result([("neutral", "本文")])
-    ctx.next_news_task = ready_future
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    # コメント来てたが prefetch ready のため反応 turn は走らない
-    ctx.saint_graph.process_turn.assert_not_called()
-    # 直接ニュース読み上げに進む
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_with_single_comment_updates_caption_with_author_and_clears_after():
-    """単一コメント picking 時: type=comment / title=視聴者名 / summary=本文のみ → 反応後にクリア。"""
-    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "テストコメントだよ"}])
-    await handle_news(ctx)
-
-    ctx.saint_graph.body.set_caption.assert_any_call(
-        type="comment", title="視聴者A", summary="テストコメントだよ"
-    )
-    ctx.saint_graph.body.set_caption.assert_any_call(visible=False)
-
-
-@pytest.mark.asyncio
-async def test_handle_news_with_multiple_comments_lists_authors_and_joins_messages():
-    """複数コメント picking 時: title=「先頭名 ほか N 名」 / summary=本文のみ改行連記（視聴者名は title 側のみ）。"""
-    ctx = _make_ctx(comments=[
-        {"author": "視聴者A", "message": "メッセージ1"},
-        {"author": "視聴者B", "message": "メッセージ2"},
-        {"author": "視聴者C", "message": "メッセージ3"},
-    ])
-    await handle_news(ctx)
-
-    expected_summary = "メッセージ1\nメッセージ2\nメッセージ3"
-    ctx.saint_graph.body.set_caption.assert_any_call(
-        type="comment", title="視聴者A ほか 2 名", summary=expected_summary
-    )
-    ctx.saint_graph.body.set_caption.assert_any_call(visible=False)
-
-
-@pytest.mark.asyncio
-async def test_handle_news_does_not_manually_toggle_auto_filler_during_comment_response():
-    """コメント反応 turn では auto_filler_stop/start を手動で呼ばない。
-    text 生成中（queue 空）は filler が出て沈黙感を埋め、 speak 投入後は
-    body-streamer 側の _auto_filler_loop が `queue empty` チェックで自動抑制する。"""
-    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "こんにちは"}])
-    await handle_news(ctx)
-
-    ctx.saint_graph.body.queue_auto_filler_stop.assert_not_called()
-    ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_does_not_toggle_auto_filler_even_if_process_turn_raises():
-    """process_turn が例外で死んでも auto_filler は触らない（手動 stop/start なし方針）。"""
-    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "こんにちは"}])
-    ctx.saint_graph.process_turn.side_effect = RuntimeError("Gemini failure")
-
-    await handle_news(ctx)
-
-    ctx.saint_graph.body.queue_auto_filler_stop.assert_not_called()
-    ctx.saint_graph.body.queue_auto_filler_start.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_clears_comment_caption_even_if_process_turn_raises():
-    """process_turn で例外が出ても caption は確実にクリアされる。"""
-    ctx = _make_ctx(comments=[{"author": "視聴者A", "message": "テストコメント"}])
-    ctx.saint_graph.process_turn.side_effect = RuntimeError("Gemini failure")
-
-    # _poll_and_respond は内部で例外を握りつぶす（False を返す）が、
-    # caption の clear は finally で確実に呼ばれる
-    await handle_news(ctx)
-
-    # set_caption は最低 2 回呼ばれる: comment 表示 + 反応後クリア
-    set_calls = ctx.saint_graph.body.set_caption.call_args_list
-    assert any(c.kwargs.get("type") == "comment" for c in set_calls)
-    assert any(c.kwargs.get("visible") is False for c in set_calls)
-
-
-@pytest.mark.asyncio
-async def test_handle_news_reading():
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-    news_service.get_next_item.return_value = item
-    
-    ctx = _make_ctx(news_service=news_service)
-    phase = await handle_news(ctx)
-    
-    assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
-        title="Title", content="Content"
-    )
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once_with(
-        [("neutral", "本文")],
-        caption_title="Title",
-        caption_summary="Content",
-        wait_after=False,
-    )
-    # handle_news が kurara_main に切替えること。最後 news (has_next=False) では
-    # _preload_first_qa_chitchat が QA 用 scene_switch を追加投入するため
-    # assert_called_once ではなく assert_any_call で本旨だけ確認する。
-    ctx.saint_graph.body.queue_scene_switch.assert_any_call("kurara_main")
-    # scene strict と speak strict は別呼出（仕様変更で speak の retry を撤去）
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action"]),
-        call(["speak-action"]),
-    ])
-    ctx.saint_graph.body.wait_for_queue.assert_not_called()
-    ctx.saint_graph.process_news_reading.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_uses_prefetched_sentences_and_prefetches_next():
-    """通常ルートで現再生＋次の preload までを spawn することを検証する。
-
-    現再生中に裏で _preload_next_news が走り、次の sentences を Gemini で取得した上で
-    speak action を先行 enqueue（preloaded_news_action_ids にセット）する仕様。
-    """
-    async def prepared_current():
-        return [("joyful", "現在ニュース")]
-
-    news_service = MagicMock()
-    news_service.has_next.return_value = True
-    current = MagicMock()
-    current.title = "Current"
-    current.content = "Current content"
-    next_item = MagicMock()
-    next_item.title = "Next"
-    next_item.content = "Next content"
-    # peek_current_item は通常ルート冒頭で current、_preload_next_news 内で next_item
-    news_service.peek_current_item.side_effect = [current, next_item]
-    news_service.get_next_item.return_value = current
-
-    ctx = _make_ctx(news_service=news_service)
-    ctx.next_news_task = asyncio.create_task(prepared_current())
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    ctx.saint_graph.body.update_news_caption.assert_not_called()
-    # 現と次の 2 つの speak action を投入する
-    assert ctx.saint_graph.play_prepared_sentences_with_caption.call_count == 2
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_any_call(
-        [("joyful", "現在ニュース")],
-        caption_title="Current",
-        caption_summary="Current content",
-        wait_after=False,
-    )
-    second_call_kwargs = ctx.saint_graph.play_prepared_sentences_with_caption.call_args_list[1].kwargs
-    assert second_call_kwargs["caption_title"] == "Next"
-    assert second_call_kwargs["caption_summary"] == "Next content"
-    assert second_call_kwargs["wait_after"] is False
-    # scene_switch は現のみ（preload では scene 切替しない）
-    ctx.saint_graph.body.queue_scene_switch.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action"]),
-        call(["speak-action"]),
-    ])
-    ctx.saint_graph.body.wait_for_queue.assert_not_called()
-    ctx.saint_graph.process_news_reading.assert_not_called()
-    # 次の Gemini prefetch は preload 内で next_item に対して 1 回呼ばれる
-    ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
-        title="Next", content="Next content"
-    )
-    # 次ループ用に preloaded がセットされている
-    assert ctx.preloaded_news_action_ids is not None
-    assert ctx.preloaded_news_item is next_item
-    # 現の prefetch task は消費済み
-    assert ctx.next_news_task is None
-
-
-@pytest.mark.asyncio
-async def test_handle_news_scene_strict_retries_then_closes_on_double_failure():
-    """scene strict は retry 付き helper（_queue_and_wait_strict）。 2 回失敗で CLOSING、 speak は投入されない。"""
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.body.queue_scene_switch.side_effect = [
-        {"action_id": "scene-1"},
-        {"action_id": "scene-2"},
-    ]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [False, False]
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.CLOSING
-    assert ctx.closing_reason == "technical_failure"
-    assert ctx.saint_graph.body.queue_scene_switch.call_count == 2
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-1"]),
-        call(["scene-2"]),
-    ])
-    ctx.saint_graph.prepare_news_reading_text.assert_called_once_with(
-        title="Title", content="Content"
-    )
-    # scene 確定前に CLOSING へフォールバックするため speak は投入されない
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_handle_news_scene_strict_retry_then_speak_succeeds():
-    """scene strict は retry 付き、 speak strict は retry なしで成功する正常パス。"""
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-    news_service.get_next_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.play_prepared_sentences_with_caption.return_value = ["speak-1"]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [
-        False,  # scene strict 1 回目失敗
-        True,   # scene strict retry で成功
-        True,   # speak strict 成功
-    ]
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    assert ctx.closing_reason is None
-    # play_prepared_sentences_with_caption は scene 確定後に 1 回だけ呼ばれる（retry なし）
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once_with(
-        [("neutral", "本文")],
-        caption_title="Title",
-        caption_summary="Content",
-        wait_after=False,
-    )
-    # strict は scene 2 回（retry）と speak 1 回の合計 3 回
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action"]),
-        call(["scene-action"]),
-        call(["speak-1"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_news_strict_checks_all_speak_action_ids():
-    """speak strict は全 speak action_id を一括で確認する（scene strict とは別呼出）。"""
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-    news_service.get_next_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.prepare_news_reading_text.return_value = [
-        ("neutral", "一文目"),
-        ("joyful", "二文目"),
-    ]
-    ctx.saint_graph.play_prepared_sentences_with_caption.return_value = [
-        "speak-1",
-        "speak-2",
-    ]
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.NEWS
-    # scene strict と speak strict は別呼出。speak 側は全 ids 一括
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action"]),
-        call(["speak-1", "speak-2"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_news_speak_failure_closes_immediately_without_retry():
-    """speak strict 失敗は retry せず即 CLOSING/technical_failure。 二重発話を避ける。"""
-    news_service = MagicMock()
-    news_service.has_next.side_effect = [True, False]
-    item = MagicMock()
-    item.title = "Title"
-    item.content = "Content"
-    news_service.peek_current_item.return_value = item
-    news_service.get_next_item.return_value = item
-
-    ctx = _make_ctx(news_service=news_service)
-    ctx.saint_graph.play_prepared_sentences_with_caption.return_value = ["speak-1"]
-    ctx.saint_graph.body.wait_for_queue_strict.side_effect = [
-        True,   # scene strict 成功
-        False,  # speak strict 失敗（retry なし）
-    ]
-
-    phase = await handle_news(ctx)
-
-    assert phase == BroadcastPhase.CLOSING
-    assert ctx.closing_reason == "technical_failure"
-    # play_prepared_sentences_with_caption は 1 回しか呼ばれない（retry なしで二重発話を回避）
-    ctx.saint_graph.play_prepared_sentences_with_caption.assert_called_once()
-    ctx.saint_graph.body.wait_for_queue_strict.assert_has_calls([
-        call(["scene-action"]),
-        call(["speak-1"]),
-    ])
-
-
-@pytest.mark.asyncio
-async def test_handle_news_finished():
-    news_service = MagicMock()
-    news_service.has_next.return_value = False
-    
-    ctx = _make_ctx(news_service=news_service)
-    phase = await handle_news(ctx)
-    
-    assert phase == BroadcastPhase.QA
-    ctx.saint_graph.process_news_finished.assert_called_once()
-    ctx.saint_graph.body.clear_news_caption.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -987,6 +637,131 @@ async def test_handle_intro_news1_speak_has_caption_synced():
     assert captured[1]["caption_title"] == "ニュースタイトル"
     assert captured[1]["caption_summary"] == "ニュース要約本文"
     assert captured[1]["prepared_wav_path"] == "/tmp/news1_0.wav"
+
+
+@pytest.mark.asyncio
+async def test_handle_news_uses_prepared_current_news_with_caption():
+    """ctx.prepared_current_news が事前に設定されているとき、 handle_news は
+    現 news 分は再合成せず prepared wav を queue_speak で投入する
+    （最初の sentence に caption 同期）。
+    """
+    news_service = MagicMock()
+    item = MagicMock()
+    item.title = "ニュース2タイトル"
+    item.content = "ニュース2要約"
+    news_service.peek_current_item.return_value = item
+    # 現 news を消化したら次が無い（最後の news 扱い）。 _preload_after_current_news の
+    # 影響を測定外にし、 「現 news 分の再合成が起きない」のみを検証する。
+    news_service.has_next.return_value = False
+    news_service.items = [item]
+
+    ctx = _make_ctx(news_service=news_service)
+    ctx.prepared_current_news = {
+        "item": item,
+        "sentences": [
+            {"file_path": "/tmp/n2_0.wav", "duration": 4.0, "style": "neutral", "text": "本文1"},
+            {"file_path": "/tmp/n2_1.wav", "duration": 3.0, "style": "neutral", "text": "本文2"},
+        ],
+    }
+
+    captured = []
+
+    async def queue_speak(text=None, style=None, speaker_id=None,
+                         caption_title=None, caption_summary=None,
+                         prepared_wav_path=None, prepared_duration=None):
+        captured.append({
+            "prepared_wav_path": prepared_wav_path,
+            "caption_title": caption_title,
+        })
+        return {"action_id": f"speak-{prepared_wav_path}"}
+
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+
+    await handle_news(ctx)
+
+    # 2 sentence 投入、 最初だけ caption 同期
+    assert len(captured) == 2
+    assert captured[0]["prepared_wav_path"] == "/tmp/n2_0.wav"
+    assert captured[0]["caption_title"] == "ニュース2タイトル"
+    assert captured[1]["prepared_wav_path"] == "/tmp/n2_1.wav"
+    assert captured[1]["caption_title"] is None
+    # 現 news 分の Gemini 再生成は呼ばれない（prepared から直接使う）
+    ctx.saint_graph.prepare_news_reading_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_news_prepares_next_news_during_current_playback():
+    """現 news 再生 enqueue 後、 次 news の Gemini 生成 + TTS 合成が裏で走り
+    ctx.prepared_next_news に格納される（複数 news 連鎖の lookahead）。
+    """
+    current_item = MagicMock(title="C", content="c")
+    next_item = MagicMock(title="N", content="n")
+
+    news_service = MagicMock()
+    news_service.has_next.return_value = True
+    # peek は handle_news 入口で current, 進めたあとに next を返す
+    news_service.peek_current_item.side_effect = [current_item, next_item, next_item]
+
+    ctx = _make_ctx(news_service=news_service)
+    ctx.prepared_current_news = {
+        "item": current_item,
+        "sentences": [{"file_path": "/tmp/c.wav", "duration": 1.0, "style": "neutral", "text": "c"}],
+    }
+    # 次 news の Gemini 生成は別 sentences を返す
+    ctx.saint_graph.prepare_news_reading_text = AsyncMock(
+        return_value=[("neutral", "next-text")]
+    )
+
+    await handle_news(ctx)
+
+    # 次 news を Gemini 生成
+    ctx.saint_graph.prepare_news_reading_text.assert_awaited_with(title="N", content="n")
+    # 合成も走った（少なくとも 1 回、 次 news 分）
+    assert ctx.saint_graph.prepare_sentences_synth.await_count >= 1
+    # ctx.prepared_next_news に格納
+    assert ctx.prepared_next_news is not None
+    assert ctx.prepared_next_news["item"] is next_item
+
+
+@pytest.mark.asyncio
+async def test_handle_news_last_item_prepares_news_finished_and_qa_intro():
+    """最後の news を読むとき、 再生中に news_finished / qa_intro / qa_first_chitchat
+    の合成も裏で走り ctx に保存される（QA への沈黙短縮）。
+    """
+    last_item = MagicMock(title="L", content="l")
+
+    news_service = MagicMock()
+    # 最後の news なので「次」は無い
+    news_service.has_next.return_value = False
+    news_service.peek_current_item.return_value = last_item
+    news_service.items = [last_item]
+
+    ctx = _make_ctx(news_service=news_service)
+    ctx.prepared_current_news = {
+        "item": last_item,
+        "sentences": [{"file_path": "/tmp/l.wav", "duration": 1.0, "style": "neutral", "text": "l"}],
+    }
+
+    ctx.saint_graph.prepare_news_finished_text = AsyncMock(
+        return_value=[("neutral", "finished")]
+    )
+    ctx.saint_graph.prepare_qa_intro_text = AsyncMock(
+        return_value=[("joyful", "qa-intro")]
+    )
+    ctx.saint_graph.prepare_qa_chitchat_text = AsyncMock(
+        return_value=[("neutral", "qa-first")]
+    )
+
+    await handle_news(ctx)
+
+    # news_finished / qa_intro / qa_first の Gemini 生成が呼ばれた
+    ctx.saint_graph.prepare_news_finished_text.assert_awaited_once()
+    ctx.saint_graph.prepare_qa_intro_text.assert_awaited_once()
+    ctx.saint_graph.prepare_qa_chitchat_text.assert_awaited_once()
+    # ctx に prepared を保存
+    assert ctx.prepared_news_finished is not None
+    assert ctx.prepared_qa_intro is not None
+    assert ctx.prepared_qa_first is not None
 
 
 @pytest.mark.asyncio

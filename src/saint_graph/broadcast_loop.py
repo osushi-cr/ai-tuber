@@ -44,6 +44,15 @@ class BroadcastContext:
     # 各要素は {"file_path", "duration", "style", "text"} の dict。
     prepared_intro: Optional[List[Dict[str, Any]]] = None
     prepared_news1: Optional[List[Dict[str, Any]]] = None
+    # NEWS フェーズで「現 news」「次 news」の lookahead 合成結果を保持する。
+    # それぞれ {"item": NewsItem, "sentences": List[...]} の dict。
+    # handle_news 入口で next → current に格上げし、 次の合成は再び next に格納。
+    prepared_current_news: Optional[Dict[str, Any]] = None
+    prepared_next_news: Optional[Dict[str, Any]] = None
+    # 最後の news 再生中に裏で合成しておく「news 終わり」「QA 開始」「QA 初手雑談」の prepared。
+    prepared_news_finished: Optional[List[Dict[str, Any]]] = None
+    prepared_qa_intro: Optional[List[Dict[str, Any]]] = None
+    prepared_qa_first: Optional[List[Dict[str, Any]]] = None
     # handle_intro で news1 を speak まで先回り投入したときの action_ids と原ニュース。
     # handle_news 冒頭でこれを検知して二重投入を回避し、再生完了待ち＋次 prefetch 仕込みだけ行う。
     preloaded_news_action_ids: Optional[List[str]] = None
@@ -467,157 +476,107 @@ async def handle_intro(ctx: BroadcastContext) -> BroadcastPhase:
 
 
 async def handle_news(ctx: BroadcastContext) -> BroadcastPhase:
+    """NEWS: prepared wav ベースで news をテンポ良く読み上げる。
+
+    各ループで:
+    - ctx.prepared_current_news（無ければ即時生成 + 合成）を queue_speak で投入
+      （最初の sentence に caption_title / caption_summary を同期）
+    - 裏で「次 news の Gemini 生成 + TTS 合成」を起動 → ctx.prepared_next_news に格納
+    - 最後の news の場合は news_finished / qa_intro / qa_first_chitchat の合成も
+      裏で起動して ctx.prepared_news_finished / qa_intro / qa_first に保存
+    - news_service カーソル前進 + 次ループでは prepared_next_news を current に格上げ
+
+    順序保証は body の worker queue が担う（speak / scene / bgm / content / caption が
+    すべて同じ queue を通る）。
     """
-    NEWS: ニュースをテンポ良く読み上げる。 コメント反応は **次ニュースの
-    prefetch が完了していないとき限定** で時間稼ぎとして挟む。
-
-    プリフェッチ最適化:
-    - 現ニュースのセリフは ctx.next_news_task に既に生成されているはず（無ければ即時生成）
-    - 現ニュース再生開始前に「次のニュース」のセリフ生成 task をキック
-    - 再生完了と caption/音声の成否を wait_for_queue_strict で確認 → 次ループへ
-
-    コメント反応の挟み込み方針:
-    - 次ニュースの prefetch task が完了していれば → コメント拾いをスキップして即ニュース
-    - 次ニュースの prefetch task が進行中なら → 待ち時間にコメントを返す（時間稼ぎ）
-    - ニュース全消化後は QA フェーズに遷移してコメント反応コーナーへ
-
-    ニュースを全消化したら QA へ遷移する。
-    """
-    # 先行投入済みのニュース（intro または前ループ末尾の _preload_next_news で enqueue 済）が
-    # あれば、それを再生して、再生中に「次の次」を先行 enqueue する。これで全 news が連鎖する。
-    # scene/caption は先行投入時に同梱済なので追加処理は不要。
-    if ctx.preloaded_news_action_ids is not None:
-        item = ctx.preloaded_news_item
-        action_ids = ctx.preloaded_news_action_ids
-        ctx.preloaded_news_action_ids = None
-        ctx.preloaded_news_item = None
-
-        logger.info(f"Reading pre-queued news: {item.title if item else '(unknown)'}")
-
-        # 現ニュースの index を進める（peek 済みアイテムを advance）
-        ctx.news_service.get_next_item()
-
-        # 次ニュースを先行 enqueue（現再生中に裏で Gemini 取得＋ TTS 合成 task が裏で進む）
-        preload_task = asyncio.create_task(_preload_next_news(ctx))
-
-        ok = await ctx.saint_graph.body.wait_for_queue_strict(action_ids=action_ids)
-        if not ok:
-            preload_task.cancel()
-            try:
-                await preload_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            ctx.closing_reason = "technical_failure"
-            return BroadcastPhase.CLOSING
-
-        # 並走させた preload を念のため待つ（既に終わっていれば即 return）
-        try:
-            await preload_task
-        except Exception as e:
-            logger.warning(f"Preload task error after current playback: {e}")
-
-        try:
-            await ctx.saint_graph.body.play_filler("aizuchi")
-        except Exception as e:
-            logger.warning(f"Failed to queue filler between news items: {e}")
-
-        return BroadcastPhase.NEWS
-
-    # ニュース全消化 → QA（コメント拾いコーナー）へ
-    if not ctx.news_service.has_next():
-        logger.info("All news items read. Moving to QA (comment corner).")
-        try:
-            await ctx.saint_graph.body.clear_news_caption()
-        except Exception as e:
-            logger.warning(f"Failed to clear news caption: {e}")
-        await ctx.saint_graph.process_news_finished()
-        return BroadcastPhase.QA
-
-    # 次ニュースの prefetch が終わっていなければ、 待ち時間にコメント反応で繋ぐ。
-    # done() なら即ニュース読み上げに進む（コメントは QA フェーズで拾う）。
-    next_ready = (
-        ctx.next_news_task is not None and ctx.next_news_task.done()
-    )
-    if not next_ready:
-        if await _poll_and_respond(ctx):
-            ctx.idle_counter = 0
-            return BroadcastPhase.NEWS
+    # 入口で「次 news の prepared」を「現 news の prepared」に格上げする。
+    if ctx.prepared_next_news is not None:
+        ctx.prepared_current_news = ctx.prepared_next_news
+        ctx.prepared_next_news = None
 
     item = ctx.news_service.peek_current_item()
-    if not item:
+    if item is None:
         return BroadcastPhase.QA
 
-    logger.info(f"Reading news item: {item.title}")
-
-    # 現ニュース: prefetch 済 task があれば生成結果を使い、無ければ即時生成
-    if ctx.next_news_task is not None:
-        try:
-            sentences = await ctx.next_news_task
-        except Exception as e:
-            logger.warning(f"Prefetched news task failed, falling back to inline generation: {e}")
-            sentences = await ctx.saint_graph.prepare_news_reading_text(
-                title=item.title, content=item.content
-            )
-        ctx.next_news_task = None
-    else:
+    # 現 news の prepared を取得。 未準備 or item 不一致なら fallback でその場で生成。
+    prepared = ctx.prepared_current_news
+    if prepared is None or prepared.get("item") is not item:
         sentences = await ctx.saint_graph.prepare_news_reading_text(
             title=item.title, content=item.content
         )
+        prepared_sentences = await ctx.saint_graph.prepare_sentences_synth(sentences)
+        prepared = {"item": item, "sentences": prepared_sentences}
 
-    # 現ニュースの index を進める
-    ctx.news_service.get_next_item()
-
-    # 現ニュース scene 切替（strict）
-    main_scene = os.getenv("BROADCAST_MAIN_SCENE", "kurara_main")
-    if not await _queue_scene_switch_strict(ctx, main_scene, "NEWS entry scene_switch"):
-        ctx.closing_reason = "technical_failure"
-        return BroadcastPhase.CLOSING
-
-    # 現ニュースを speak action queue に enqueue（wait なし）
-    try:
-        current_action_ids = await ctx.saint_graph.play_prepared_sentences_with_caption(
-            sentences,
-            caption_title=item.title,
-            caption_summary=item.content,
-            wait_after=False,
+    # 現 news を queue_speak で順次投入（最初の sentence のみ caption 同期）
+    for i, s in enumerate(prepared.get("sentences") or []):
+        await ctx.saint_graph.body.queue_speak(
+            text=s.get("text", ""),
+            style=s.get("style"),
+            prepared_wav_path=s.get("file_path"),
+            prepared_duration=s.get("duration"),
+            caption_title=item.title if i == 0 else None,
+            caption_summary=item.content if i == 0 else None,
         )
-        if not current_action_ids:
-            logger.warning("NEWS speak did not return action_id")
-            ctx.closing_reason = "technical_failure"
-            return BroadcastPhase.CLOSING
-    except Exception as e:
-        logger.warning(f"NEWS speak/caption action error: {e}")
-        ctx.closing_reason = "technical_failure"
-        return BroadcastPhase.CLOSING
 
-    # 次ニュースを先行 enqueue（現再生中に裏で Gemini 取得＋ TTS 合成 task が裏で進む）
-    preload_task = asyncio.create_task(_preload_next_news(ctx))
+    # 消化フラグ: news_service のカーソル前進＋ ctx.prepared_current_news クリア
+    ctx.news_service.get_next_item()
+    ctx.prepared_current_news = None
 
-    # 現ニュースの再生完了を strict に確認する（speak は retry なし、部分再生→ retry 二重発話回避）
-    ok = await ctx.saint_graph.body.wait_for_queue_strict(current_action_ids)
-    if not ok:
-        logger.warning("NEWS speak/caption action failed (no retry; falling back to CLOSING)")
-        preload_task.cancel()
-        try:
-            await preload_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        ctx.closing_reason = "technical_failure"
-        return BroadcastPhase.CLOSING
+    # 裏で「次 news」 or 「news 終了系」の合成を進める
+    await _preload_after_current_news(ctx)
 
-    # 並走させた preload を念のため待つ（既に終わっていれば即 return）
-    try:
-        await preload_task
-    except Exception as e:
-        logger.warning(f"Preload task error after current playback: {e}")
-
-    # ニュース完了 → aizuchi 系 filler を 1 個積んで次のセリフ生成中の沈黙を埋める
-    try:
-        await ctx.saint_graph.body.play_filler("aizuchi")
-    except Exception as e:
-        logger.warning(f"Failed to queue filler between news items: {e}")
-
+    if ctx.news_service.peek_current_item() is None and not ctx.news_service.has_next():
+        # 次が無い ＝ 最後の news を読み終えた → QA へ
+        return BroadcastPhase.QA
     return BroadcastPhase.NEWS
+
+
+async def _preload_after_current_news(ctx: BroadcastContext) -> None:
+    """現 news を読み終えた直後に、 「次 news」 or 「news_finished / qa_intro /
+    qa_first_chitchat」の Gemini 生成 + TTS 合成を裏で進める。
+
+    視聴者を待たせないため、 これらの合成は現 news 再生中に並行進行する想定。
+    fail-soft: 個別失敗は warning ログのみで継続。
+    """
+    if ctx.news_service.has_next():
+        # 次 news を prepare
+        next_item = ctx.news_service.peek_current_item()
+        if next_item is None:
+            return
+        try:
+            sentences = await ctx.saint_graph.prepare_news_reading_text(
+                title=next_item.title, content=next_item.content
+            )
+            prepared_sentences = await ctx.saint_graph.prepare_sentences_synth(sentences)
+            ctx.prepared_next_news = {"item": next_item, "sentences": prepared_sentences}
+        except Exception as e:
+            logger.warning(f"prepare next news failed: {e}")
+        return
+
+    # 次 news が無い ＝ 直前の current が最後の news → 終わり系を裏で合成
+    try:
+        finished = await ctx.saint_graph.prepare_news_finished_text()
+        if finished:
+            ctx.prepared_news_finished = await ctx.saint_graph.prepare_sentences_synth(finished)
+    except Exception as e:
+        logger.warning(f"prepare news_finished failed: {e}")
+
+    try:
+        qa_intro = await ctx.saint_graph.prepare_qa_intro_text()
+        if qa_intro:
+            ctx.prepared_qa_intro = await ctx.saint_graph.prepare_sentences_synth(qa_intro)
+    except Exception as e:
+        logger.warning(f"prepare qa_intro failed: {e}")
+
+    try:
+        recent_titles = [it.title for it in (ctx.news_service.items or [])]
+        qa_first = await ctx.saint_graph.prepare_qa_chitchat_text(
+            recent_titles=recent_titles
+        )
+        if qa_first:
+            ctx.prepared_qa_first = await ctx.saint_graph.prepare_sentences_synth(qa_first)
+    except Exception as e:
+        logger.warning(f"prepare qa_first failed: {e}")
 
 
 # QA で促進セリフを発する間隔（poll サイクル数）。1cycle = POLL_INTERVAL 秒。
