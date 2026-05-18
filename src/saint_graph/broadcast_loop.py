@@ -264,34 +264,10 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
             f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
         )
 
-        # コメント反応セリフ生成・再生中はそのコメントを caption に表示し続ける。
-        # title=最初の視聴者名（複数なら「ほか N 名」付与）、 summary=本文のみ（連記時は改行）。
-        first_author = picked[0].get("author", "User")
-        if len(picked) > 1:
-            caption_title = f"{first_author} ほか {len(picked) - 1} 名"
-            # 複数 picking 時の summary は本文のみ改行連記（視聴者名の重複表示を避ける）
-            caption_summary = "\n".join(c.get("message", "") for c in picked)
-        else:
-            caption_title = first_author
-            caption_summary = picked[0].get("message", "")
-        try:
-            await ctx.saint_graph.body.set_caption(
-                type="comment",
-                title=caption_title,
-                summary=caption_summary,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to update comment caption: {e}")
-
-        try:
-            await ctx.saint_graph.process_turn(comments_text)
-        finally:
-            # 反応完了後は caption をクリア。 次のニュース読み上げに上書きされる
-            # 場合もあるが、 QA フェーズなど後続が無い場合の取り残しを防ぐ。
-            try:
-                await ctx.saint_graph.body.set_caption(visible=False)
-            except Exception as e:
-                logger.warning(f"Failed to clear comment caption: {e}")
+        # コメント自体は comments.html overlay（右下スライド表示）で独立に描画されるため、
+        # ここで caption を書き換えない（news caption を上書きしないことで、
+        # ニュース読み上げ中もタイトル表示が継続する）。
+        await ctx.saint_graph.process_turn(comments_text)
 
         return True
     except Exception as e:
