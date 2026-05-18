@@ -194,20 +194,15 @@ sed -i '' 's/^STREAMING_MODE=true/STREAMING_MODE=false/' ~/src/github.com/osushi
 
 ---
 
-## 2026-05-13 切替の引き継ぎ（初回実走で確認）
+## 現行構成メモ（2026-05-18 時点）
 
-本日（2026-05-13）に Irodori-TTS と Gemini を両方 GA / stable 系に切り替えました。**次の本番配信が初回実走**になるため、以下を意識して観察してください。
+| 領域 | 現行値 |
+|---|---|
+| Irodori-TTS チェックポイント | `Aratako/Irodori-TTS-500M-v3` |
+| Irodori-TTS `seconds` 指定 | `seconds=None`（Duration Predictor 自動推定） |
+| Gemini モデル ID（saint_graph / closing） | **`gemini-2.5-flash-lite`** ※ 3.1 GA は応答不安定で 2.5 維持を継続 |
 
-### 変更内容
-
-| 領域 | Before | After | commit |
-|---|---|---|---|
-| Irodori-TTS チェックポイント | `Aratako/Irodori-TTS-500M-v2` | **`Aratako/Irodori-TTS-500M-v3`** | `6f644df` |
-| Irodori-TTS `seconds` 指定 | `_estimate_seconds(text) = len/4.5 + 1.0` | **`seconds=None`**（Duration Predictor 自動推定） | `6f644df` |
-| Gemini モデル ID（saint_graph / closing） | `gemini-3.1-flash-lite-preview` | **`gemini-3.1-flash-lite`**（GA 版） | `d4fc4ad` |
-| docs/README 内表記 | `gemini-2.5-flash-lite` 残置（コードは既に 3.1） | **`gemini-3.1-flash-lite` に統一** | `d4fc4ad` |
-
-すべて `feature/voice-adapter-miotts` ブランチに push 済。
+Irodori-TTS は v3-bench ブランチで v3 release コミット `6993be3` を含むこと。
 
 ### Irodori-TTS リポ側の要件
 
