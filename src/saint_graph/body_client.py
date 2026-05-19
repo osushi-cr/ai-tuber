@@ -119,7 +119,8 @@ class BodyClient:
             "style": style,
             "speaker_id": speaker_id,
         }
-        data = await self._request("POST", "/api/speak/prepare", payload)
+        # ニュース本文の長文は TTS 合成が 30s を超える。実測 35s 前後で連鎖失敗するため余裕を持って 120s。
+        data = await self._request("POST", "/api/speak/prepare", payload, timeout=120.0)
         if data:
             return data
         return {"file_path": "", "duration": 0.0}
