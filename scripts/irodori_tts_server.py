@@ -13,6 +13,7 @@ body venv を ML スタックで汚染せずに済むよう、本ファイルは
     IRODORI_CHECKPOINT_REPO   default Aratako/Irodori-TTS-500M-v3
     IRODORI_CODEC_REPO    default Aratako/Semantic-DACVAE-Japanese-32dim
     IRODORI_REF_WAV       default ~/src/personal/Irodori-TTS/voice_library/kurara/reference.wav
+    IRODORI_REF_EMBED     Speaker Inversion embedding (.speaker.safetensors)。設定時は ref_wav より優先
     IRODORI_DEVICE        default mps
     IRODORI_PRECISION     default fp32
     IRODORI_NUM_STEPS     default 8
@@ -57,6 +58,7 @@ REF_WAV = os.getenv(
     "IRODORI_REF_WAV",
     str(Path.home() / "src/personal/Irodori-TTS/voice_library/kurara/reference.wav"),
 )
+REF_EMBED = os.getenv("IRODORI_REF_EMBED", "")
 DEVICE = os.getenv("IRODORI_DEVICE", "mps")
 PRECISION = os.getenv("IRODORI_PRECISION", "fp32")
 NUM_STEPS = int(os.getenv("IRODORI_NUM_STEPS", "8"))
@@ -90,11 +92,19 @@ def _load_runtime() -> InferenceRuntime:
             compile_dynamic=False,
         )
     )
+    ref_mode = f"ref_embed={REF_EMBED}" if REF_EMBED else f"ref_wav={REF_WAV}"
     logger.info(
-        "Runtime ready (device=%s precision=%s steps=%d schedule=%s sway_coeff=%.2f)",
-        DEVICE, PRECISION, NUM_STEPS, T_SCHEDULE_MODE, SWAY_COEFF,
+        "Runtime ready (device=%s precision=%s steps=%d schedule=%s sway_coeff=%.2f %s)",
+        DEVICE, PRECISION, NUM_STEPS, T_SCHEDULE_MODE, SWAY_COEFF, ref_mode,
     )
     return runtime
+
+
+def _ref_kwargs() -> dict:
+    """ref_embed が設定されていれば ref_wav より優先する。"""
+    if REF_EMBED:
+        return {"ref_embed": REF_EMBED, "ref_wav": None, "ref_latent": None, "no_ref": False}
+    return {"ref_wav": REF_WAV, "ref_latent": None, "no_ref": False}
 
 
 def _prewarm(runtime: InferenceRuntime) -> None:
@@ -104,9 +114,7 @@ def _prewarm(runtime: InferenceRuntime) -> None:
         SamplingRequest(
             text="ウォームアップ。",
             caption=None,
-            ref_wav=REF_WAV,
-            ref_latent=None,
-            no_ref=False,
+            **_ref_kwargs(),
             ref_normalize_db=-16.0,
             ref_ensure_max=True,
             num_candidates=1,
@@ -181,9 +189,7 @@ def _synthesize_locked(text: str) -> TTSResponse:
         SamplingRequest(
             text=text,
             caption=None,
-            ref_wav=REF_WAV,
-            ref_latent=None,
-            no_ref=False,
+            **_ref_kwargs(),
             ref_normalize_db=-16.0,
             ref_ensure_max=True,
             num_candidates=1,
