@@ -385,6 +385,9 @@ class SaintGraph:
                     )
                     collected_sentences.extend(sentences)
                 
+                if collected_sentences:
+                    full_text = " / ".join(text for _, text in collected_sentences)
+                    logger.info(f"[Gemini] {context or 'turn'}: {full_text}")
                 return collected_sentences
 
             except Exception as e:
@@ -528,8 +531,9 @@ class SaintGraph:
         return reason
 
     def _clean_sentence(self, sentence: str) -> str:
-        """文中に残った単純な感情タグを取り除きます。"""
-        return re.sub(r'\[emotion:\s*(\w+)\]', '', sentence).strip()
+        """感情タグを取り除きます。絵文字は voice_normalizer 側で認識外のみ除去する。"""
+        sentence = re.sub(r'\[emotion:\s*(\w+)\]', '', sentence)
+        return sentence.strip()
 
     def _extract_text_from_event(self, event) -> Optional[str]:
         """ADKイベントからテキストを抽出します。"""

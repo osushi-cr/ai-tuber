@@ -126,16 +126,46 @@ _COMMON_ABBREVS = [
 _COMMON_ABBREVS_SORTED = sorted(_COMMON_ABBREVS, key=lambda x: -len(x[0]))
 
 
-# 絵文字（ピクトグラム / シンボル / 装飾）も学習データ外で TTS が暴走するため除去する。
+# Irodori-TTS が感情表現として認識する絵文字。テキスト中に残すとスタイル制御に使われる。
+# https://github.com/Aratako/Irodori-TTS duration.py ALLOWED_ANNOTATION_EMOJIS と同期。
+ALLOWED_IRODORI_EMOJIS: frozenset[str] = frozenset((
+    "⏩", "⏱️", "⏸️", "🌬️", "🍭", "🎛️", "🎭", "🎵", "🐢", "🐱",
+    "👂", "👃", "👅", "👌", "👏", "💋", "💥", "💦", "💪", "📄",
+    "📞", "📢", "📣", "😆", "😊", "😌", "😎", "😏", "😒", "😖",
+    "😟", "😠", "😪", "😭", "😮", "😮‍💨", "😰", "😱", "😲", "😴",
+    "🙄", "🙏", "🤐", "🤔", "🤢", "🤧", "🤭", "🥤", "🥱", "🥴",
+    "🥵", "🥹", "🥺", "🫣", "🫶", "📖",
+))
+
+# 許可リストにマッチする絵文字を先に退避してから残りを除去するパターン。
+_ALLOWED_EMOJI_PATTERN = re.compile(
+    "|".join(sorted((re.escape(e) for e in ALLOWED_IRODORI_EMOJIS), key=len, reverse=True))
+)
 _EMOJI_PATTERN = re.compile(
     "["
-    "\U0001F300-\U0001F9FF"  # Misc Symbols and Pictographs / Emoticons / Transport / Supplemental
-    "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
-    "\U00002600-\U000027BF"  # Misc Symbols / Dingbats（✨ ★ ☆ 等）
-    "\U0001F1E6-\U0001F1FF"  # Regional Indicator
+    "\U0001F300-\U0001F9FF"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0000FE00-\U0000FE0F"
+    "\U0000200D"
     "]+",
     flags=re.UNICODE,
 )
+
+
+def _strip_unrecognized_emojis(text: str) -> str:
+    """Irodori-TTS が認識しない絵文字だけ除去し、認識する絵文字は残す。"""
+    placeholder = "\x00"
+    kept: list[str] = []
+    def _save(m: re.Match) -> str:
+        kept.append(m.group())
+        return placeholder
+    text = _ALLOWED_EMOJI_PATTERN.sub(_save, text)
+    text = _EMOJI_PATTERN.sub("", text)
+    for emoji in kept:
+        text = text.replace(placeholder, emoji, 1)
+    return text
 
 
 # 1桁数字をTTS読みに変換するテーブル。"〇" は TTS が「まる」と読み揺れするため
@@ -209,20 +239,25 @@ def _normalize_numbers_and_symbols(text: str) -> str:
 def normalize_text(text: str) -> str:
     """TTS が暴走しないよう & 正しく読めるよう日本語テキストを正規化する。
 
-    - 絵文字除去
+    - 認識外絵文字のみ除去（Irodori-TTS 認識絵文字は感情表現として残す）
     - 波ダッシュ削除（「みんな〜」→「みんな」、「ー」変換だと音声崩壊）
     - 半角・全角空白除去（日本語テキストとして不自然＋暴走トリガーになる）
-    - 感嘆符・疑問符（！？!?）を句点「。」に統一（混在で暴走するため）
-    - 連続「。」を1つに圧縮
+    - 連続句読点を1つに圧縮
     - 既知略語・固有名詞をカタカナ化
     - 数値・記号正規化（カンマ削除・%・±符号・&・＝・$・ハイフン）
     - 残った2文字以上の連続英字を削除（暴走防止セーフティネット）
     """
-    text = _EMOJI_PATTERN.sub("", text)
+    text = _strip_unrecognized_emojis(text)
     text = text.replace("〜", "").replace("～", "")
     text = text.replace(" ", "").replace("　", "")
-    text = re.sub(r"[！？!?]", "。", text)
-    text = re.sub(r"。+", "。", text)
+    text = re.sub(r"!", "！", text)
+    text = re.sub(r"\?", "？", text)
+    text = text.replace("⁈", "？！").replace("⁉", "！？")
+    text = text.replace("‼", "！").replace("‽", "？")
+    text = re.sub(r"[。！？]{3,}", lambda m: m.group()[:2], text)
+    text = re.sub(r"([。！？])\1+", r"\1", text)
+    text = re.sub(r"。([！？])", r"\1", text)
+    text = re.sub(r"([！？])。", r"\1", text)
     # COMMON_ABBREVS は数値・記号正規化より先に適用する（"S&P500" のような記号入り略語が
     # "&" → "アンド" 置換で拾えなくなるのを防ぐ）。長い順で置換することで "AI" / "AIO" の
     # ような接頭辞衝突（"AIO" が "AI"+"O" と先取りされるケース）も回避する。
