@@ -13,6 +13,10 @@ _COMMON_ABBREVS = [
     ("YouTube", "ユーチューブ"),
     ("ChatGPT", "チャットジーピーティー"),
     ("Claude", "クロード"),
+    # 2026-05-29 配信で "Claude Opus 4.8" の Opus が英字残存→TTS読めず（Claude→クロード変換後に Opus が孤立）。同族の Sonnet/Haiku も予防的に追加
+    ("Opus", "オーパス"),
+    ("Sonnet", "ソネット"),
+    ("Haiku", "ハイク"),
     ("Gemini", "ジェミニ"),
     ("OpenAI", "オープンエーアイ"),
     ("Anthropic", "アンソロピック"),
