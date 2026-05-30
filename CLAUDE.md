@@ -200,7 +200,7 @@ sed -i '' 's/^STREAMING_MODE=true/STREAMING_MODE=false/' ~/src/github.com/osushi
 |---|---|
 | Irodori-TTS チェックポイント | `Aratako/Irodori-TTS-500M-v3` |
 | Irodori-TTS `seconds` 指定 | `seconds=None`（Duration Predictor 自動推定） |
-| Gemini モデル ID（saint_graph / closing） | **`gemini-2.5-flash-lite`** ※ 3.1 GA は応答不安定で 2.5 維持を継続 |
+| Gemini モデル ID（saint_graph / closing） | **`gemini-3.1-flash-lite`** ※ 2.5 は free tier 20RPM で枯渇するため 3.1 に切替（2026-05-21） |
 
 Irodori-TTS は v3-bench ブランチで v3 release コミット `6993be3` を含むこと。
 

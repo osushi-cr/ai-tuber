@@ -264,10 +264,18 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
             f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
         )
 
-        # コメント自体は comments.html overlay（右下スライド表示）で独立に描画されるため、
-        # ここで caption を書き換えない（news caption を上書きしないことで、
-        # ニュース読み上げ中もタイトル表示が継続する）。
-        await ctx.saint_graph.process_turn(comments_text)
+        # ピックアップしたコメントを caption に表示
+        first = picked[0]
+        await ctx.saint_graph.body.set_caption(
+            type="comment",
+            title=first.get("author", ""),
+            summary=first.get("message", ""),
+        )
+        await ctx.saint_graph.process_turn(
+            comments_text,
+            context="Viewer comment reply. Answer thoughtfully in 3-5 sentences, showing genuine interest in their comment.",
+        )
+        await ctx.saint_graph.body.queue_caption_clear()
 
         return True
     except Exception as e:

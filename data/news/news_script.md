@@ -1,26 +1,26 @@
 # News Script
 
-## Google「Googlebook」発表 — AI時代の新型ノートPC
-* GoogleがChromebookの後継として新カテゴリのノートPC「Googlebook」を発表した
-* AndroidとChromeOSを融合し、GeminiをOSの中核に置くインテリジェンスファーストな設計
-* Google DeepMindと共同開発した「Magic Pointer」でカーソルがAIサジェストを提供し、2026年秋に発売予定
+## Google、動画生成AI「Gemini Omni」を発表
+* GoogleとDeepMindが画像・音声・映像・テキストを入力として高品質な動画を生成できるAIモデル「Gemini Omni」を発表した。
+* 自然言語での会話ベース編集、物理法則に基づくリアルな映像生成、アバター機能を搭載し、全動画にSynthIDウォーターマークを付与する。
+* 今日からGemini appのPlus・Pro・Ultraユーザー向け、Google Flow、YouTube Shortsに展開開始し、数週間以内にAPIでも提供予定。
 
-## DeepMind、Magic Pointer発表 — AI時代のカーソルUI
-* DeepMindがGooglebookに搭載される「Magic Pointer」の技術詳細を公開した
-* カーソルが指した対象をGeminiがリアルタイムで文脈理解し、コンテキストに応じたAIサジェストを提供する
-* メールの日付にカーソルを当てると会議設定を提案するなど、GUIの基本操作をAIで再設計した
+## OpenAI、バイオ防衛AI「Rosalind Biodefense」を公開
+* OpenAIがバイオ防衛特化AIプラットフォーム「Rosalind Biodefense」を正式公開した。
+* 審査済みの開発者と米国政府パートナーにGPT-Rosalindモデルへのアクセスを提供し、感染症対策・公衆衛生・パンデミック準備を支援する。
+* 医療・生物学分野でのAI活用を政府レベルで拡大する取り組みで、バイオセキュリティへのAI統合という新たな分野を開拓する。
 
-## OpenAI×NVIDIA：CodexとGPT-5.5で本番開発を加速
-* NVIDIAのエンジニアがOpenAI CodexとGPT-5.5を使い本番システム構築と研究実験を加速させているケーススタディを公開した
-* GPU最大手がAIコーディングエージェントを中核的な開発ツールとして採用している事実を示す
-* NVIDIAのハードウェアとOpenAIのソフトウェアが相互に依存し合う業界構造の深化を示唆している
+## Google I/O 2026 Gemini OmniとGemini 3.5の9つのデモ公開
+* Google公式ブログがI/O 2026で発表されたGemini OmniとGemini 3.5の主要デモ9本をまとめて公開した。
+* Gemini Omniによる動画生成、Gemini 3.5のリアルタイム推論・エージェント機能など最新能力を実演している。
+* Google Antigravity 2.0などの開発者向けプラットフォームの新機能も紹介されており、エージェント時代のGeminiの全体像が示された。
 
-## OpenAI「Parameter Golf」実験レポート — AI支援ML研究の知見
-* OpenAIが1000人超が参加した「Parameter Golf」MLリサーチコンペの実験報告を公開した
-* 厳しい制約下でAIを使って機械学習研究や量子化、新モデル設計に挑む実験で2000件超の作品が提出された
-* AI支援科学の方法論やベンチマーク設計に新しい知見をもたらす成果となった
+## OpenAI、AI評価の共通プレイブックを発表
+* OpenAIがフロンティアAIモデルの第三者評価に関する共通ガイダンスを公開した。
+* モデルの能力・安全策・有効性を評価する標準的手順をまとめ、評価の信頼性と透明性を高めることを目的としている。
+* EUのAI法やカリフォルニア州規制を含む主要規制フレームワークとの整合も図っており、業界の評価標準化に貢献する。
 
-## 金融チームのCodex活用法 — MBRから計画シナリオまで
-* OpenAI Academyが金融チーム向けにCodexで財務業務を自動化する実践ガイドを公開した
-* 月次業績レビューや差異分析ブリッジ、計画シナリオ構築をCodexで効率化する手法を解説している
-* コーディングスキルなしに財務ワークフローを自動化できるようになり、ビジネス部門へのAI普及が加速している
+## OpenAIとBoston Children's Hospitalが40件超の希少疾患診断に成功
+* Boston Children's HospitalがOpenAI技術を活用し、40件以上の希少疾患の新規診断に成功したと発表した。
+* AIによる患者ケアの改善と業務負担軽減を実現し、診断困難な希少疾患へのアプローチを革新した。
+* 世界に7000種類以上ある希少疾患の診断ボトルネックをAIが解消できることを示す、医療AI実用化の重要な事例となっている。

@@ -65,21 +65,35 @@ if start_if_idle 8000 "body-streamer"; then
 fi
 
 echo ""
-echo "Waiting 8s for services to come up..."
-sleep 8
-
-echo ""
-echo "=== Status ==="
 if [[ "${TTS_ENGINE}" == "irodori" ]]; then
     PORTS=(8003 8000)
 else
     PORTS=(8002 8001 8000)
 fi
+
+MAX_WAIT=30
+ELAPSED=0
+echo "Waiting for services (up to ${MAX_WAIT}s)..."
+while (( ELAPSED < MAX_WAIT )); do
+    ALL_UP=true
+    for port in "${PORTS[@]}"; do
+        if ! lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+            ALL_UP=false
+            break
+        fi
+    done
+    if $ALL_UP; then break; fi
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+done
+
+echo ""
+echo "=== Status ==="
 for port in "${PORTS[@]}"; do
     if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "  ✅ :${port}"
     else
-        echo "  ❌ :${port} (failed to start, check ${LOG_DIR}/)"
+        echo "  ❌ :${port} (failed to start after ${MAX_WAIT}s, check ${LOG_DIR}/)"
     fi
 done
 

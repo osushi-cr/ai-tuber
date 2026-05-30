@@ -12,8 +12,11 @@ PORT="${IRODORI_PORT:-8003}"
 mkdir -p "${LOG_DIR}"
 
 if lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "  ✓ irodori-tts-server already running on :${PORT}"
-    exit 0
+    OLD_PID=$(lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1)
+    echo "  ↻ killing stale irodori-tts-server (PID=${OLD_PID}) on :${PORT}"
+    kill "${OLD_PID}" 2>/dev/null
+    sleep 2
+    kill -9 "${OLD_PID}" 2>/dev/null || true
 fi
 
 if [[ ! -x "${IRODORI_DIR}/.venv/bin/python" ]]; then
