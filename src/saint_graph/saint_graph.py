@@ -307,13 +307,25 @@ class SaintGraph:
 
     # --- メインターン処理 ---
 
-    async def process_turn(self, user_input: str, context: Optional[str] = None, wait_after: bool = True):
+    async def process_turn(
+        self,
+        user_input: str,
+        context: Optional[str] = None,
+        wait_after: bool = True,
+        caption_title: Optional[str] = None,
+        caption_summary: Optional[str] = None,
+        caption_type: Optional[str] = None,
+    ):
         """
         単一のインタラクションターンを処理します。
         AIからのテキスト出力を取得し、文章単位で Body API (TTS) を実行します。
 
         wait_after=False のとき、speak キュー投入まで完了したら return し、再生完了は待たない。
         プリフェッチ用（呼び出し側で wait_for_queue するなど別途同期する）。
+
+        caption_title / caption_summary / caption_type を渡すと、最初の発話の再生開始と
+        同期して caption overlay を表示する（コメント回答時の「どのコメントに答えているか」
+        提示などに使う）。
         """
         logger.info(f"Turn started. Input: {user_input[:50]}..., Context: {context}")
         await self.body.change_emotion("silent")
@@ -322,7 +334,13 @@ class SaintGraph:
             logger.warning("No text output received from AI.")
             return
 
-        await self._play_sentences(sentences, wait_after=wait_after)
+        await self._play_sentences(
+            sentences,
+            wait_after=wait_after,
+            first_caption_title=caption_title,
+            first_caption_summary=caption_summary,
+            caption_type=caption_type,
+        )
 
     async def _collect_turn_sentences(
         self,
@@ -416,6 +434,7 @@ class SaintGraph:
         wait_after: bool = True,
         first_caption_title: Optional[str] = None,
         first_caption_summary: Optional[str] = None,
+        caption_type: Optional[str] = None,
     ) -> List[str]:
         """生成済みの文を順に発話キューへ投入します。"""
         sentences_spoken = 0
@@ -431,6 +450,7 @@ class SaintGraph:
                 emotion,
                 caption_title=caption_title,
                 caption_summary=caption_summary,
+                caption_type=caption_type if sentences_spoken == 0 else None,
             )
             if action_id:
                 speak_action_ids.append(action_id)
@@ -506,6 +526,7 @@ class SaintGraph:
         emotion: str,
         caption_title: Optional[str] = None,
         caption_summary: Optional[str] = None,
+        caption_type: Optional[str] = None,
     ) -> Optional[str]:
         """1文を発話キューに入れます。"""
         # 単純なタグは除去
@@ -517,6 +538,8 @@ class SaintGraph:
                 kwargs["caption_title"] = caption_title
             if caption_summary is not None:
                 kwargs["caption_summary"] = caption_summary
+            if caption_type is not None:
+                kwargs["caption_type"] = caption_type
             response = await self.body.queue_speak(sentence, **kwargs)
             if isinstance(response, dict):
                 action_id = response.get("action_id")

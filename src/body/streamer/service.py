@@ -355,6 +355,7 @@ class StreamerBodyService(BodyServiceBase):
         speaker_id = task.get("speaker_id")
         caption_title = task.get("caption_title")
         caption_summary = task.get("caption_summary")
+        caption_type = task.get("caption_type", "news")
         synth_task = task.get("_synth_task")
         prepared_wav_path = task.get("prepared_wav_path")
         prepared_duration = task.get("prepared_duration")
@@ -374,7 +375,7 @@ class StreamerBodyService(BodyServiceBase):
         #    HTML overlay（OBS ブラウザソース）が /api/caption/state をポーリングして表示する。
         if caption_title is not None or caption_summary is not None:
             await self.set_caption(
-                type="news",
+                type=caption_type,
                 title=caption_title or "",
                 summary=caption_summary or "",
                 visible=True,
@@ -430,6 +431,7 @@ class StreamerBodyService(BodyServiceBase):
         speaker_id: Optional[int] = None,
         caption_title: Optional[str] = None,
         caption_summary: Optional[str] = None,
+        caption_type: str = "news",
         prepared_wav_path: Optional[str] = None,
         prepared_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -437,6 +439,7 @@ class StreamerBodyService(BodyServiceBase):
 
         prepared_wav_path 指定時は事前合成済 wav をそのまま再生する。
         prepared_duration は再生時間の見積もり（未指定時は 0.0 で再生）。
+        caption_type は caption overlay の表示タイプ（"news" / "comment" 等）。
         """
         result = await self._enqueue_action("speak", {
             "text": text,
@@ -444,6 +447,7 @@ class StreamerBodyService(BodyServiceBase):
             "speaker_id": speaker_id,
             "caption_title": caption_title,
             "caption_summary": caption_summary,
+            "caption_type": caption_type,
             "prepared_wav_path": prepared_wav_path,
             "prepared_duration": prepared_duration,
         }, "Speech queued")

@@ -79,6 +79,7 @@ class BodyClient:
         speaker_id: Optional[int] = None,
         caption_title: Optional[str] = None,
         caption_summary: Optional[str] = None,
+        caption_type: Optional[str] = None,
         prepared_wav_path: Optional[str] = None,
         prepared_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -86,6 +87,7 @@ class BodyClient:
 
         prepared_wav_path / prepared_duration を渡すと body 側は事前合成済 wav を
         再生する（waiting 60秒中に prepare_speak で合成しておいた wav を後段で再生する用）。
+        caption_type は caption overlay の表示タイプ（未指定時 body 側で "news"）。
         """
         payload = {"text": text}
         if style:
@@ -96,6 +98,8 @@ class BodyClient:
             payload["caption_title"] = caption_title
         if caption_summary is not None:
             payload["caption_summary"] = caption_summary
+        if caption_type is not None:
+            payload["caption_type"] = caption_type
         if prepared_wav_path is not None:
             payload["prepared_wav_path"] = prepared_wav_path
         if prepared_duration is not None:

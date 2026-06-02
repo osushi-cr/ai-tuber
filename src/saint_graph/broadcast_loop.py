@@ -264,16 +264,18 @@ async def _poll_and_respond(ctx: BroadcastContext) -> bool:
             f"Comments received ({len(picked)}/{len(comments_data)} picked): {comments_text}"
         )
 
-        # ピックアップしたコメントを caption に表示
+        # コメントキャプション（type=comment）は回答の再生開始と同期させる。
+        # 即時 set_caption だと caption が先に出て応答音声（queue 経由）とズレるため、
+        # process_turn の最初の発話 wav 再生開始に合わせて body 側で caption を出す。
+        # （どのコメントが来たかの「コメント表示」自体は comments.html が /api/comments を
+        #   自律ポーリングして別途流すため、ここでは回答同期キャプションのみ扱う）
         first = picked[0]
-        await ctx.saint_graph.body.set_caption(
-            type="comment",
-            title=first.get("author", ""),
-            summary=first.get("message", ""),
-        )
         await ctx.saint_graph.process_turn(
             comments_text,
             context="Viewer comment reply. Answer thoughtfully in 3-5 sentences, showing genuine interest in their comment.",
+            caption_title=first.get("author", ""),
+            caption_summary=first.get("message", ""),
+            caption_type="comment",
         )
         await ctx.saint_graph.body.queue_caption_clear()
 

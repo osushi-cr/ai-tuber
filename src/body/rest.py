@@ -42,6 +42,7 @@ class BodyApp:
             speaker_id = body.get("speaker_id")
             caption_title = body.get("caption_title")
             caption_summary = body.get("caption_summary")
+            caption_type = body.get("caption_type", "news")
             prepared_wav_path = body.get("prepared_wav_path")
             prepared_duration = body.get("prepared_duration")
             result = await self.service.speak(
@@ -50,6 +51,7 @@ class BodyApp:
                 speaker_id,
                 caption_title=caption_title,
                 caption_summary=caption_summary,
+                caption_type=caption_type,
                 prepared_wav_path=prepared_wav_path,
                 prepared_duration=prepared_duration,
             )
