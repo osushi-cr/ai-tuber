@@ -469,6 +469,54 @@ async def test_handle_qa_plays_prepared_news_finished_qa_intro_qa_first_on_first
 
 
 @pytest.mark.asyncio
+async def test_handle_qa_waits_for_entry_speeches_before_returning():
+    """QA 初回エントリは、定型発話（finished/intro/first）の再生完了を
+    wait_for_queue_strict で待ってから return する。これを待たずに返すと、
+    次サイクルのコメント反応キャプション（type=comment）が定型発話の合間に
+    再生され「キャプション見失い」になる（YOS-52）。
+    """
+    ctx = _make_ctx()
+    ctx.prepared_news_finished = [
+        {"file_path": "/tmp/finished.wav", "duration": 2.0, "style": "neutral", "text": "おしまい"}
+    ]
+    ctx.prepared_qa_intro = [
+        {"file_path": "/tmp/qa_intro.wav", "duration": 2.0, "style": "joyful", "text": "コメントどうぞ"}
+    ]
+    ctx.prepared_qa_first = [
+        {"file_path": "/tmp/qa_first.wav", "duration": 2.0, "style": "neutral", "text": "雑談1"}
+    ]
+
+    async def queue_speak(text=None, style=None, speaker_id=None,
+                          caption_title=None, caption_summary=None,
+                          prepared_wav_path=None, prepared_duration=None):
+        return {"action_id": f"s-{prepared_wav_path}"}
+
+    ctx.saint_graph.body.queue_speak = AsyncMock(side_effect=queue_speak)
+    ctx.saint_graph.body.wait_for_queue_strict = AsyncMock(return_value=True)
+
+    await handle_qa(ctx)
+
+    # 定型発話3件の action_id すべてを strict 待ちしてから return する
+    ctx.saint_graph.body.wait_for_queue_strict.assert_awaited_once_with(
+        action_ids=["s-/tmp/finished.wav", "s-/tmp/qa_intro.wav", "s-/tmp/qa_first.wav"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_qa_second_entry_does_not_wait_for_entry_speeches():
+    """2 回目以降の entry（phase_scene_initialized 済）は定型発話を積まないので、
+    entry 用の wait_for_queue_strict は呼ばれない。"""
+    from saint_graph.broadcast_loop import BroadcastPhase
+    ctx = _make_ctx(comments=[])
+    ctx.phase_scene_initialized.add(BroadcastPhase.QA)
+    ctx.saint_graph.body.wait_for_queue_strict = AsyncMock(return_value=True)
+
+    await handle_qa(ctx)
+
+    ctx.saint_graph.body.wait_for_queue_strict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handle_qa_first_entry_clears_news_caption_before_news_finished_speak():
     """QA 初回 entry で content_set(qa, True) の直後、 news_finished speak の前に
     queue_caption_clear が呼ばれる（最後の news caption が news_finished 再生中に

@@ -485,32 +485,40 @@ async def handle_qa(ctx: BroadcastContext) -> BroadcastPhase:
         except Exception as e:
             logger.warning(f"Failed to queue caption clear at QA entry: {e}")
 
-        for sentence in ctx.prepared_news_finished or []:
-            await ctx.saint_graph.body.queue_speak(
+        # QA 入口の定型発話（news_finished / qa_intro / qa_first）の action_id を集める。
+        # これらの再生が終わるまでコメント反応を始めないことで、コメントキャプション
+        # （type=comment）が定型発話の合間に再生されて「見失い」になるのを防ぐ。
+        entry_action_ids: List[str] = []
+        for sentence in (
+            (ctx.prepared_news_finished or [])
+            + (ctx.prepared_qa_intro or [])
+            + (ctx.prepared_qa_first or [])
+        ):
+            resp = await ctx.saint_graph.body.queue_speak(
                 text=sentence.get("text", ""),
                 style=sentence.get("style"),
                 prepared_wav_path=sentence.get("file_path"),
                 prepared_duration=sentence.get("duration"),
             )
-        for sentence in ctx.prepared_qa_intro or []:
-            await ctx.saint_graph.body.queue_speak(
-                text=sentence.get("text", ""),
-                style=sentence.get("style"),
-                prepared_wav_path=sentence.get("file_path"),
-                prepared_duration=sentence.get("duration"),
-            )
-        for sentence in ctx.prepared_qa_first or []:
-            await ctx.saint_graph.body.queue_speak(
-                text=sentence.get("text", ""),
-                style=sentence.get("style"),
-                prepared_wav_path=sentence.get("file_path"),
-                prepared_duration=sentence.get("duration"),
-            )
+            action_id = _extract_action_id(resp)
+            if action_id:
+                entry_action_ids.append(action_id)
 
         ctx.prepared_news_finished = None
         ctx.prepared_qa_intro = None
         ctx.prepared_qa_first = None
         ctx.phase_scene_initialized.add(BroadcastPhase.QA)
+
+        # 定型発話が全て再生し終わるまで待ってから QA ループ（コメント反応）に入る。
+        # これを待たずに return すると、次サイクルの _poll_and_respond が
+        # コメントキャプションを queue に積み、定型発話の合間に再生されてしまう。
+        if entry_action_ids:
+            try:
+                await ctx.saint_graph.body.wait_for_queue_strict(
+                    action_ids=entry_action_ids
+                )
+            except Exception as e:
+                logger.warning(f"Failed waiting for QA entry speeches: {e}")
         return BroadcastPhase.QA
 
     # 沈黙が続いたら CLOSING
