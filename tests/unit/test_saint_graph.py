@@ -341,3 +341,54 @@ def test_config_missing_api_key(monkeypatch):
     with pytest.raises(SystemExit) as e:
         cfg.validate(force_exit=True)
     assert e.value.code == 1
+
+
+# --- YOS-51: _split_sentences の文分割（QA返答 逐次再生化） ---------------
+# 契約: 戻り値の末尾要素は常に「未確定セグメント」（句点で終わらない余り。
+# 無ければ空文字）。_collect_buffered_sentences が sentences[-1] を buffer に
+# 戻し、それ以外を確定文として扱う。
+
+@pytest.mark.asyncio
+async def test_split_sentences_separates_completed_and_pending(mock_adk):
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    # 2文とも句点完結 → 両方確定し、末尾に未確定セグメント（空）を置く
+    assert sg._split_sentences("こんにちは。元気？") == ["こんにちは。", "元気？", ""]
+
+@pytest.mark.asyncio
+async def test_split_sentences_keeps_unterminated_tail(mock_adk):
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    # 句点完結＋未完成の続き → 完成文を確定、句点なしの末尾を未確定として残す
+    assert sg._split_sentences("こんにちは。元気") == ["こんにちは。", "元気"]
+
+@pytest.mark.asyncio
+async def test_split_sentences_appends_empty_tail_when_complete(mock_adk):
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    # 句点完結のみ → 即確定させるため末尾に空文字を置く（Critical 1 回帰防止）
+    assert sg._split_sentences("こんにちは。") == ["こんにちは。", ""]
+
+@pytest.mark.asyncio
+async def test_split_sentences_no_punctuation_is_pending(mock_adk):
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    # 句点なし → 未確定の1要素のみ（呼び出し側で buffer 継続）
+    assert sg._split_sentences("あああ") == ["あああ"]
+
+@pytest.mark.asyncio
+async def test_split_sentences_multiple_delimiters(mock_adk):
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    assert sg._split_sentences("A。B！C？") == ["A。", "B！", "C？", ""]
+
+@pytest.mark.asyncio
+async def test_collect_buffered_confirms_sentence_without_next_chunk(mock_adk):
+    """結合: 句点完結文が、次のチャンクを待たずに確定すること（Critical 1）。"""
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    buffered, emotion, collected = sg._collect_buffered_sentences("こんにちは。", "neutral")
+    assert collected == [("neutral", "こんにちは。")]
+    assert buffered == ""  # 末尾の空文字が buffer に戻る
+
+@pytest.mark.asyncio
+async def test_collect_buffered_holds_incomplete_sentence(mock_adk):
+    """結合: 句点未到達のテキストは確定せず buffer 継続。"""
+    sg = SaintGraph(mock_adk["BodyClient"](), "", "Instruction")
+    buffered, emotion, collected = sg._collect_buffered_sentences("途中まで", "neutral")
+    assert collected == []
+    assert buffered == "途中まで"

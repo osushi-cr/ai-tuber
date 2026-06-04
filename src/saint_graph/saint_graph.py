@@ -571,8 +571,22 @@ class SaintGraph:
         return None
 
     def _split_sentences(self, text: str, force_flush: bool = False) -> list[str]:
+        """句点（。！？改行）で文に分割する。
+
+        _collect_buffered_sentences と協調する。戻り値の末尾要素は常に
+        「未確定セグメント」（句点で終わっていない余り。無ければ空文字）であり、
+        呼び出し側がこれを buffer に戻して次のストリームチャンクを待つ。これにより
+        句点で完結した文は次チャンクを待たず即確定でき、逐次再生が成立する。
         """
-        テキストを区切りません。
-        一括でVoiceVoxに渡すことで、OBSでの2.5秒のリップシンクラグによる「文ごとの不自然な間」を解消します。
-        """
-        return [text]
+        parts = re.split(r"([。！？\n])", text)
+        sentences: list[str] = []
+        buf = ""
+        for part in parts:
+            buf += part
+            if part in "。！？\n":
+                if buf.strip():
+                    sentences.append(buf)
+                buf = ""
+        # 末尾の未確定分を必ず最後の要素として置く（空でも置く＝契約）
+        sentences.append(buf)
+        return sentences
