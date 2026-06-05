@@ -6,7 +6,7 @@
 - **キャラクター**: くらら（妹キャラ・Irodori-TTS 500M v3 で Apple Silicon ローカル合成・LLM は Gemini 3.1 Flash Lite）
 - **目的**: 個人開発の AITuber が AI ニュース等を配信する。OBS + YouTube Live + ローカル TTS の三位一体構造（魂 Saint Graph / 肉体 Body / 精神 Mind）
 - **ペンネーム**: お寿司（@osushi_cr）
-- **branch 既定**: `feature/voice-adapter-miotts`（現主力）
+- **branch 既定**: `main`（2026-06-06 に `feature/voice-adapter-miotts` を main にマージ済。以降は main で配信・開発）
 
 詳細アーキテクチャは `README.md`、エンジニアリング規約・Agent ルールは `AGENTS.md` を参照。Claude Code は本ファイルを主に読み、AGENTS.md は他 Agent（Codex 等）と共通の規約として併用する。
 

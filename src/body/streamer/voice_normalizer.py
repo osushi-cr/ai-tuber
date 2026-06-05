@@ -126,6 +126,8 @@ _COMMON_ABBREVS = [
     ("RAG", "ラグ"),
     ("ROI", "アールオーアイ"),
     ("QA", "キューエー"),
+    # 2026-06-06 配信で観察: AI/経済ニュース文脈で「市場」を「いちば」と誤読
+    ("市場", "しじょう"),
 ]
 _COMMON_ABBREVS_SORTED = sorted(_COMMON_ABBREVS, key=lambda x: -len(x[0]))
 
